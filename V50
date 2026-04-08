@@ -16,10 +16,12 @@ local raidStart = 0
 local raids = 0
 local chestsDone = false
 local creatingRaid = false
-local locallyDead = {}
+local burst = 5
+local raidOnly = true
 
 local CHEST_POS = Vector3.new(1134, 108, -5700)
-local BURST = 10 -- hits per breakable per tick
+local BURST_OPTIONS = {1, 5, 10, 25, 50, 100, math.huge}
+local TP_DISTANCE = 50 -- only TP if nearest breakable is >50 studs away
 
 local SignalMod, RaidCmds, ClientRaidInstance, RaidTypes, InstancingCmds, NetworkMod
 local modulesOk = true
@@ -33,17 +35,15 @@ NetworkMod = tryReq(RS.Library.Client.Network)
 
 local function rf(n) return Net:FindFirstChild(n) end
 
+-- Events
 if NetworkMod then
-	pcall(function() NetworkMod.Fired("PrivateInstance_Join"):Connect(function(d) if d then room=0 done=false chestsDone=false creatingRaid=false locallyDead={} raidStart=tick() end end) end)
+	pcall(function() NetworkMod.Fired("PrivateInstance_Join"):Connect(function(d) if d then room=0 done=false chestsDone=false creatingRaid=false raidStart=tick() end end) end)
 	pcall(function() NetworkMod.Fired("Raid: Spawned Room"):Connect(function(n) room=n end) end)
 	pcall(function() NetworkMod.Fired("Raid: Completed"):Connect(function() done=true end) end)
 end
-pcall(function() rf("PrivateInstance_Join").OnClientEvent:Connect(function(d) if d then room=0 done=false chestsDone=false creatingRaid=false locallyDead={} raidStart=tick() end end) end)
+pcall(function() rf("PrivateInstance_Join").OnClientEvent:Connect(function(d) if d then room=0 done=false chestsDone=false creatingRaid=false raidStart=tick() end end) end)
 pcall(function() rf("Raid: Spawned Room").OnClientEvent:Connect(function(n) room=n end) end)
 pcall(function() rf("Raid: Completed").OnClientEvent:Connect(function() done=true end) end)
-
-pcall(function() workspace.__THINGS.Breakables.ChildRemoved:Connect(function(c) local uid = c:GetAttribute("BreakableUID") if uid then locallyDead[uid] = nil end end) end)
-pcall(function() workspace.__THINGS.AnimatedBreakables.ChildRemoved:Connect(function(c) local uid = c:GetAttribute("BreakableUID") if uid then locallyDead[uid] = nil end end) end)
 
 local function loc()
 	local ok, r = pcall(function()
@@ -54,43 +54,37 @@ local function loc()
 	return ok and r or "?"
 end
 
-local function tp(p) pcall(function() local c=player.Character if c then local h=c:FindFirstChild("HumanoidRootPart") if h then h.CFrame=CFrame.new(p) end end end) end
+local function tp(p) pcall(function() local c = player.Character if c then local h = c:FindFirstChild("HumanoidRootPart") if h then h.CFrame = CFrame.new(p) end end end) end
 
 -- ============================================================
--- BURST TAP: fires AutoClicker_Nearby BURST times per breakable
--- 10 fires = 10 hits = instant one-shot on almost everything
--- Also finds nearest alive breakable + TPs to it in same pass
+-- DIRECT WORKSPACE SCAN: always fresh, never stale
+-- Returns: UIDs to tap, nearest position, distance, alive count
 -- ============================================================
-local function burstTapAndScan()
-	if not SignalMod then return nil, 0, 0 end
-
+local function scanWorkspace()
 	local myPos = Vector3.new(0, 108, -5700)
 	pcall(function() myPos = player.Character.HumanoidRootPart.Position end)
 
+	local uids = {}
 	local best, bestDist = nil, math.huge
 	local alive = 0
 
 	for _, folder in {"Breakables", "AnimatedBreakables"} do
 		pcall(function()
-			for _, b in workspace.__THINGS[folder]:GetChildren() do
+			local f = workspace.__THINGS:FindFirstChild(folder)
+			if not f then return end
+			for _, b in f:GetChildren() do
 				local uid = b:GetAttribute("BreakableUID")
 				if not uid then
-					-- no uid, skip
-				elseif locallyDead[uid] then
-					-- already dead locally, skip
+					-- skip
 				else
-					-- BURST: fire N times = N hits
-					for _ = 1, BURST do
-						SignalMod.Fire("AutoClicker_Nearby", uid)
-					end
-
-					-- Check health after burst
 					local hp = b:GetAttribute("Health")
 					if hp and hp <= 0 then
-						locallyDead[uid] = true
+						-- dead, skip
 					else
-						-- Still alive: count + find position
 						alive = alive + 1
+						table.insert(uids, uid)
+
+						-- Find position for TP
 						local hitbox = b:FindFirstChild("Hitbox")
 						if hitbox and hitbox:IsA("BasePart") then
 							local d = (hitbox.Position - myPos).Magnitude
@@ -102,46 +96,63 @@ local function burstTapAndScan()
 		end)
 	end
 
-	-- Also click all ClickDetectors
-	pcall(function()
-		for _, d in workspace.__THINGS:GetDescendants() do
-			if d:IsA("ClickDetector") then fireclickdetector(d) end
-		end
-	end)
-	pcall(function() rf("Click"):FireServer() end)
-
-	return best, bestDist, alive
+	return uids, best, bestDist, alive
 end
 
--- Light scan only (no tapping, for when tap is off)
-local function scanOnly()
-	local myPos = Vector3.new(0, 108, -5700)
-	pcall(function() myPos = player.Character.HumanoidRootPart.Position end)
-	local best, bestDist = nil, math.huge
-	local total = 0
-	for _, folder in {"Breakables", "AnimatedBreakables"} do
-		pcall(function()
-			for _, b in workspace.__THINGS[folder]:GetChildren() do
-				local hitbox = b:FindFirstChild("Hitbox")
-				if hitbox and hitbox:IsA("BasePart") then
-					total = total + 1
-					local d = (hitbox.Position - myPos).Magnitude
-					if d < bestDist then best = hitbox.Position bestDist = d end
+-- ============================================================
+-- BURST TAP: uses fresh scan results
+-- ============================================================
+local function burstTapUIDs(uids)
+	if not SignalMod then return end
+	local r = room if r < 1 then r = 1 end
+	local n = burst
+	if r >= 10 then n = math.max(n, 50) end
+	if n == math.huge then n = 999 end
+
+	for _, uid in uids do
+		for _ = 1, n do
+			SignalMod.Fire("AutoClicker_Nearby", uid)
+		end
+	end
+	pcall(function() rf("Click"):FireServer() end)
+end
+
+-- ============================================================
+-- INSTANT KILL: ChildAdded on __THINGS catches ALL new breakables
+-- Reconnects automatically when folders change
+-- ============================================================
+local function setupInstantKill()
+	-- Watch __THINGS itself for any descendant with BreakableUID
+	pcall(function()
+		workspace.__THINGS.DescendantAdded:Connect(function(obj)
+			if not tapOn or not SignalMod then return end
+			-- Check if it's a breakable model (has BreakableUID)
+			if obj:IsA("Model") then
+				local uid = obj:GetAttribute("BreakableUID")
+				if uid then
+					local n = burst
+					if n == math.huge then n = 999 end
+					for _ = 1, n do
+						SignalMod.Fire("AutoClicker_Nearby", uid)
+					end
 				end
 			end
 		end)
-	end
-	return best, bestDist, total
+	end)
 end
+setupInstantKill()
 
-local function openChests()
+-- ============================================================
+-- CHESTS + CREATION (parallel)
+-- ============================================================
+local function openChestsAndCreate()
 	local ct = ""
 	pcall(function() local cur = ClientRaidInstance.GetCurrent() if cur then ct = cur._ct or "" end end)
 	if NetworkMod and ct ~= "" then
-		pcall(function() NetworkMod.Invoke("Raids_CollectReward", "Tier1000Chest", ct) end)
-		pcall(function() NetworkMod.Invoke("Raids_CollectReward", "LootChest", ct) end)
-		pcall(function() NetworkMod.Invoke("Raids_CollectReward", "HugeChest", ct) end)
-		pcall(function() NetworkMod.Invoke("Raids_CollectReward", "TitanicChest", ct) end)
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "Tier1000Chest", ct) end) end)
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "LootChest", ct) end) end)
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "HugeChest", ct) end) end)
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "TitanicChest", ct) end) end)
 	else
 		task.spawn(function() pcall(function() rf("Raids_OpenChest"):InvokeServer("LootChest") end) end)
 		task.spawn(function() pcall(function() rf("Raids_OpenChest"):InvokeServer("HugeChest") end) end)
@@ -149,24 +160,23 @@ local function openChests()
 		task.spawn(function() pcall(function() rf("Raids_OpenChest"):InvokeServer("Tier1000Chest") end) end)
 		task.spawn(function() pcall(function() rf("Raids_CollectReward"):InvokeServer() end) end)
 	end
-end
 
-local function createNewRaid()
-	if not modulesOk then return end
-	creatingRaid = true
-	local function doCreate()
-		local level = 1 pcall(function() level = RaidCmds.GetLevel() end)
-		local pm = 1 pcall(function() pm = RaidTypes.PartyMode.Solo end)
-		local portal pcall(function() local ok, p = pcall(SignalMod.Invoke, "Get Portal Number") if ok and p then portal = p end end)
-		if not portal then pcall(function() for i = 1, 10 do if not ClientRaidInstance.GetByPortal(i) then portal = i break end end end) end
-		if not portal then creatingRaid = false return end
-		local ok, s, m, raid = pcall(RaidCmds.Create, { Portal = portal, Difficulty = level, PartyMode = pm })
-		if ok and s and raid then pcall(raid.Join, raid) end
-		creatingRaid = false
+	if modulesOk then
+		creatingRaid = true
+		local function doCreate()
+			local level = 1 pcall(function() level = RaidCmds.GetLevel() end)
+			local pm = 1 pcall(function() pm = RaidTypes.PartyMode.Solo end)
+			local portal pcall(function() local ok, p = pcall(SignalMod.Invoke, "Get Portal Number") if ok and p then portal = p end end)
+			if not portal then pcall(function() for i = 1, 10 do if not ClientRaidInstance.GetByPortal(i) then portal = i break end end end) end
+			if not portal then creatingRaid = false return end
+			local ok, s, m, raid = pcall(RaidCmds.Create, { Portal = portal, Difficulty = level, PartyMode = pm })
+			if ok and s and raid then pcall(raid.Join, raid) end
+			creatingRaid = false
+		end
+		local inInst = false pcall(function() inInst = InstancingCmds.IsInInstance() end)
+		if inInst then pcall(function() InstancingCmds.Leave(false, true, function() doCreate() end) end)
+		else doCreate() end
 	end
-	local inInst = false pcall(function() inInst = InstancingCmds.IsInInstance() end)
-	if inInst then pcall(function() InstancingCmds.Leave(false, true, function() doCreate() end) end)
-	else doCreate() end
 end
 
 -- Anti-AFK
@@ -180,17 +190,17 @@ task.spawn(function()
 end)
 
 -- GUI
-pcall(function() game:GetService("CoreGui"):FindFirstChild("AR50"):Destroy() end)
-pcall(function() player.PlayerGui:FindFirstChild("AR50"):Destroy() end)
+pcall(function() game:GetService("CoreGui"):FindFirstChild("AR55"):Destroy() end)
+pcall(function() player.PlayerGui:FindFirstChild("AR55"):Destroy() end)
 local guiParent
-local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name = "AR50" g.Parent = game:GetService("CoreGui") guiParent = g end)
+local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name = "AR55" g.Parent = game:GetService("CoreGui") guiParent = g end)
 if not ok1 then
-	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name = "AR50" g.Parent = gethui() guiParent = g end)
-	if not ok2 then local g = Instance.new("ScreenGui") g.Name = "AR50" g.ResetOnSpawn = false g.Parent = player.PlayerGui guiParent = g end
+	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name = "AR55" g.Parent = gethui() guiParent = g end)
+	if not ok2 then local g = Instance.new("ScreenGui") g.Name = "AR55" g.ResetOnSpawn = false g.Parent = player.PlayerGui guiParent = g end
 end
 guiParent.ResetOnSpawn = false
 
-local fr = Instance.new("Frame") fr.Size = UDim2.new(0, 195, 0, 210) fr.Position = UDim2.new(0, 10, 0.5, -105) fr.BackgroundColor3 = Color3.fromRGB(15, 15, 15) fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+local fr = Instance.new("Frame") fr.Size = UDim2.new(0, 195, 0, 255) fr.Position = UDim2.new(0, 10, 0.5, -127) fr.BackgroundColor3 = Color3.fromRGB(15, 15, 15) fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
 Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
 
 local dragging, dragStart, startPos
@@ -211,7 +221,7 @@ local yy = 4
 local function lbl(t, c, s) local l = Instance.new("TextLabel") l.Size = UDim2.new(1, -10, 0, 14) l.Position = UDim2.new(0, 5, 0, yy) l.BackgroundTransparency = 1 l.Text = t l.TextColor3 = c or Color3.fromRGB(190, 190, 190) l.TextSize = s or 11 l.Font = Enum.Font.Gotham l.TextXAlignment = Enum.TextXAlignment.Left l.Parent = fr yy = yy + 15 return l end
 local function mbtn(t, c) local b = Instance.new("TextButton") b.Size = UDim2.new(1, -10, 0, 22) b.Position = UDim2.new(0, 5, 0, yy) b.BackgroundColor3 = c b.Text = t b.TextColor3 = Color3.new(1, 1, 1) b.TextSize = 12 b.Font = Enum.Font.GothamBold b.Parent = fr Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5) yy = yy + 25 return b end
 
-lbl("RAID BOOST v50", Color3.new(1, 1, 1), 14).Font = Enum.Font.GothamBold
+lbl("RAID BOOST v55", Color3.new(1, 1, 1), 14).Font = Enum.Font.GothamBold
 local sL = lbl("OFF") local rL = lbl("--") local dL = lbl("", Color3.fromRGB(255, 200, 80), 9) local tL = lbl("", Color3.fromRGB(100, 200, 255), 9)
 
 local tapB = mbtn("360° Tap: OFF", Color3.fromRGB(50, 50, 50))
@@ -219,6 +229,33 @@ tapB.MouseButton1Click:Connect(function()
 	tapOn = not tapOn
 	tapB.Text = "360° Tap: " .. (tapOn and "ON" or "OFF")
 	tapB.BackgroundColor3 = tapOn and Color3.fromRGB(200, 80, 0) or Color3.fromRGB(50, 50, 50)
+	if tapOn then
+		task.spawn(function()
+			while tapOn do
+				pcall(function()
+					local uids = scanWorkspace()
+					burstTapUIDs(uids)
+				end)
+				-- Adaptive rate: fewer breakables = slower tap (less lag)
+				task.wait(0.05)
+			end
+		end)
+	end
+end)
+
+local burstIdx = 2
+local burstB = mbtn("Burst: 5x", Color3.fromRGB(100, 0, 150))
+burstB.MouseButton1Click:Connect(function()
+	burstIdx = burstIdx % #BURST_OPTIONS + 1
+	burst = BURST_OPTIONS[burstIdx]
+	burstB.Text = "Burst: " .. (burst == math.huge and "INF" or tostring(burst)) .. "x"
+end)
+
+local modeB = mbtn("Mode: Raid Only", Color3.fromRGB(0, 80, 130))
+modeB.MouseButton1Click:Connect(function()
+	raidOnly = not raidOnly
+	modeB.Text = "Mode: " .. (raidOnly and "Raid Only" or "Anywhere")
+	modeB.BackgroundColor3 = raidOnly and Color3.fromRGB(0, 80, 130) or Color3.fromRGB(130, 80, 0)
 end)
 
 local timerB = mbtn("Timer: OFF", Color3.fromRGB(50, 50, 50))
@@ -240,10 +277,23 @@ local function boostLoop()
 	while RUN do
 		pcall(function()
 			local l = loc()
+			local inRaid = (l == "R")
 
-			if l ~= "R" and not creatingRaid then
+			if showTimer and raidStart > 0 and inRaid then
+				tL.Text = string.format("%.0fs", tick() - raidStart)
+			end
+
+			if not raidOnly and not inRaid and not creatingRaid then
+				st("Tapping...")
+				local uids, _, _, alive = scanWorkspace()
+				rm(alive .. " targets") db("anywhere")
+				task.wait(0.1)
+				return
+			end
+
+			if not inRaid and not creatingRaid then
 				st("Waiting...") db("loc=" .. l)
-				chestsDone = false done = false emptyTime = 0 sawBreakables = false locallyDead = {}
+				chestsDone = false done = false emptyTime = 0 sawBreakables = false
 				task.wait(0.5)
 				return
 			end
@@ -254,46 +304,39 @@ local function boostLoop()
 				return
 			end
 
-			if showTimer and raidStart > 0 then tL.Text = string.format("%.0fs", tick() - raidStart) end
+			local r = room if r < 1 then r = 1 end
 
 			if not done then
-				local r = room if r < 1 then r = 1 end
+				-- Direct workspace scan (always fresh)
+				local uids, nearPos, nearDist, alive = scanWorkspace()
+
 				st("Room " .. r)
+				rm(alive .. " alive")
 
-				local nearPos, nearDist, alive
-
-				if tapOn then
-					-- Burst tap + scan in one pass
-					nearPos, nearDist, alive = burstTapAndScan()
-					rm(alive .. " alive")
-				else
-					-- Scan only
-					nearPos, nearDist, alive = scanOnly()
-					rm(alive .. " targets")
-				end
-
-				if alive > 0 and nearPos then
+				if alive > 0 then
 					sawBreakables = true
 					emptyTime = 0
-					tp(Vector3.new(nearPos.X, 108, nearPos.Z))
-					db(alive .. " | d=" .. string.format("%.0f", nearDist))
+
+					-- Always TP to nearest breakable
+					if nearPos then
+						tp(Vector3.new(nearPos.X, 108, nearPos.Z))
+					end
+
+					db(alive .. " | d=" .. string.format("%.0f", nearDist or 0))
 				else
-					if sawBreakables then emptyTime = emptyTime + 0.03 end
+					if sawBreakables then emptyTime = emptyTime + 0.05 end
 					if r >= 10 and sawBreakables and emptyTime > 2 then done = true end
 					db("empty " .. string.format("%.1f", emptyTime) .. "s")
 				end
 
 			elseif not chestsDone then
-				st("Chests!")
+				st("Chests + Next!")
 				tp(CHEST_POS)
-				task.wait(0.5)
-				openChests()
-				task.wait(1)
 				chestsDone = true
 				raids = raids + 1
 				if showTimer and raidStart > 0 then tL.Text = string.format("Last: %.0fs", tick() - raidStart) end
 				rm("Raids: " .. raids)
-				task.spawn(createNewRaid)
+				task.spawn(openChestsAndCreate)
 
 			else
 				st("Next raid...")
@@ -301,20 +344,17 @@ local function boostLoop()
 			end
 		end)
 
-		task.wait(0.03)
+		task.wait(0.05)
 	end
 end
 
 goB.MouseButton1Click:Connect(function()
 	RUN = not RUN
 	if RUN then
-		raidStart = tick() raids = 0 room = 0 done = false chestsDone = false creatingRaid = false locallyDead = {}
+		raidStart = tick() raids = 0 room = 0 done = false chestsDone = false creatingRaid = false
 		goB.Text = "STOP" goB.BackgroundColor3 = Color3.fromRGB(180, 0, 0)
 		task.spawn(function()
-			while RUN do
-				pcall(boostLoop)
-				if RUN then task.wait(2) end
-			end
+			while RUN do pcall(boostLoop) if RUN then task.wait(2) end end
 			st("OFF") rm("--") db("") tL.Text = ""
 		end)
 	else
