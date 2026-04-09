@@ -1,0 +1,42 @@
+pcall(function()
+	print("=== NETWORK REMOTES ===")
+	for _, c in game.ReplicatedStorage.Network:GetChildren() do
+		print(c.ClassName, c.Name)
+	end
+end)
+
+pcall(function()
+	print("=== BREAKABLES FOLDER ===")
+	print("Breakables exists:", workspace.__THINGS:FindFirstChild("Breakables") ~= nil)
+	print("AnimatedBreakables exists:", workspace.__THINGS:FindFirstChild("AnimatedBreakables") ~= nil)
+	local count = 0
+	for _, b in workspace.__THINGS.Breakables:GetChildren() do
+		count = count + 1
+		if count <= 2 then
+			print("--- Breakable:", b.Name, "---")
+			for k, v in pairs(b:GetAttributes()) do
+				print("  ", k, "=", v)
+			end
+			for _, d in b:GetChildren() do
+				print("  child:", d.ClassName, d.Name)
+			end
+		end
+	end
+	print("Total breakables:", count)
+end)
+
+pcall(function()
+	print("=== __THINGS CHILDREN ===")
+	for _, c in workspace.__THINGS:GetChildren() do
+		print(c.ClassName, c.Name, "#" .. #c:GetChildren())
+	end
+end)
+
+pcall(function()
+	print("=== ACTIVE ===")
+	for _, c in workspace.__THINGS.__INSTANCE_CONTAINER.Active:GetChildren() do
+		print(c.Name)
+	end
+end)
+
+print("=== DONE ===")
