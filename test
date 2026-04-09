@@ -1,0 +1,41 @@
+local RS = game:GetService("ReplicatedStorage")
+local RaidCmds = require(RS.Library.Client.RaidCmds)
+local RaidTypes = require(RS.Library.Types.Raids)
+local Signal = require(RS.Library.Signal)
+local ClientRaidInstance = require(RS.Library.Client.RaidCmds.ClientRaidInstance)
+
+local myLevel = RaidCmds.GetLevel()
+print("Your level:", myLevel)
+
+-- Find portal
+local portal = nil
+for i = 1, 10 do
+    if not ClientRaidInstance.GetByPortal(i) then
+        portal = i
+        break
+    end
+end
+print("Portal:", portal)
+
+-- Try creating at difficulty 50000 (max)
+local ok, success, msg, raid = pcall(RaidCmds.Create, {
+    Portal = portal,
+    Difficulty = 50000,
+    PartyMode = RaidTypes.PartyMode.Solo
+})
+print("OK:", ok, "Success:", success, "Msg:", msg, "Raid:", raid)
+
+if ok and success and raid then
+    print("CREATED AT 50000! Joining...")
+    local jok, js, je = pcall(raid.Join, raid)
+    print("Join:", jok, js, je)
+else
+    print("Failed. Server probably validates difficulty.")
+    -- Try your actual level + 1000
+    local ok2, s2, m2, r2 = pcall(RaidCmds.Create, {
+        Portal = portal,
+        Difficulty = myLevel + 1000,
+        PartyMode = RaidTypes.PartyMode.Solo
+    })
+    print("Level+1000:", ok2, s2, m2, r2)
+end
