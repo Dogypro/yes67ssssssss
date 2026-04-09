@@ -1,0 +1,102 @@
+-- DIAGNOSTIC: dumps game structure to clipboard
+local output = {}
+local function add(s) table.insert(output, s) end
+
+add("=== NETWORK REMOTES ===")
+pcall(function()
+	for _, c in game.ReplicatedStorage.Network:GetChildren() do
+		add(c.ClassName .. " | " .. c.Name)
+	end
+end)
+
+add("\n=== REPLICATED STORAGE MODULES ===")
+pcall(function()
+	for _, c in game.ReplicatedStorage.Library:GetDescendants() do
+		if c:IsA("ModuleScript") then
+			add("  " .. c:GetFullName())
+		end
+	end
+end)
+
+add("\n=== WORKSPACE.__THINGS STRUCTURE ===")
+pcall(function()
+	for _, c in workspace.__THINGS:GetChildren() do
+		add(c.ClassName .. " | " .. c.Name .. " | children=" .. #c:GetChildren())
+	end
+end)
+
+add("\n=== BREAKABLE SAMPLE (first 3) ===")
+pcall(function()
+	local count = 0
+	for _, b in workspace.__THINGS.Breakables:GetChildren() do
+		if count >= 3 then break end
+		count = count + 1
+		add("--- Breakable: " .. b.Name .. " ---")
+		for _, attr in b:GetAttributes() do end
+		for k, v in b:GetAttributes() do
+			add("  attr: " .. k .. " = " .. tostring(v))
+		end
+		for _, d in b:GetChildren() do
+			add("  child: " .. d.ClassName .. " | " .. d.Name)
+			if d:IsA("Model") or d:IsA("Folder") then
+				for _, dd in d:GetChildren() do
+					add("    " .. dd.ClassName .. " | " .. dd.Name)
+				end
+			end
+		end
+	end
+end)
+
+add("\n=== ACTIVE INSTANCES ===")
+pcall(function()
+	local active = workspace.__THINGS.__INSTANCE_CONTAINER.Active
+	for _, c in active:GetChildren() do
+		add(c.ClassName .. " | " .. c.Name)
+		for _, cc in c:GetChildren() do
+			add("  " .. cc.ClassName .. " | " .. cc.Name)
+		end
+	end
+end)
+
+add("\n=== RAID STRUCTURE ===")
+pcall(function()
+	local raid = workspace.__THINGS.__INSTANCE_CONTAINER.Active.LuckyRaid
+	for _, c in raid:GetChildren() do
+		add(c.ClassName .. " | " .. c.Name)
+		if c.Name == "Rooms" then
+			for _, r in c:GetChildren() do
+				add("  " .. r.Name .. " | children=" .. #r:GetChildren())
+				for _, rc in r:GetChildren() do
+					add("    " .. rc.ClassName .. " | " .. rc.Name)
+				end
+			end
+		end
+		if c.Name == "FinalArea" then
+			for _, fa in c:GetChildren() do
+				add("  " .. fa.ClassName .. " | " .. fa.Name)
+			end
+		end
+	end
+end)
+
+add("\n=== PLAYER SCRIPTS ===")
+pcall(function()
+	for _, s in game.Players.LocalPlayer.PlayerScripts:GetDescendants() do
+		if s:IsA("LocalScript") or s:IsA("ModuleScript") then
+			add(s.ClassName .. " | " .. s:GetFullName())
+		end
+	end
+end)
+
+add("\n=== STARTER GUI SCRIPTS ===")
+pcall(function()
+	for _, s in game.StarterGui:GetDescendants() do
+		if s:IsA("LocalScript") or s:IsA("ModuleScript") then
+			add(s.ClassName .. " | " .. s:GetFullName())
+		end
+	end
+end)
+
+local result = table.concat(output, "\n")
+setclipboard(result)
+print("COPIED " .. #output .. " lines to clipboard")
