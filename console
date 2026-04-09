@@ -1,0 +1,58 @@
+-- Create ScreenGui
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "ConsoleUI"
+ScreenGui.Parent = game.Players.LocalPlayer:WaitForChild("PlayerGui")
+
+-- Main Frame
+local Frame = Instance.new("Frame")
+Frame.Size = UDim2.new(0, 400, 0, 250)
+Frame.Position = UDim2.new(0.5, -200, 0.5, -125)
+Frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+Frame.Parent = ScreenGui
+
+-- TextBox (Console Output)
+local TextBox = Instance.new("TextBox")
+TextBox.Size = UDim2.new(1, -20, 1, -60)
+TextBox.Position = UDim2.new(0, 10, 0, 10)
+TextBox.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+TextBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+TextBox.TextXAlignment = Enum.TextXAlignment.Left
+TextBox.TextYAlignment = Enum.TextYAlignment.Top
+TextBox.TextWrapped = false
+TextBox.Text = "Console output here..."
+TextBox.ClearTextOnFocus = false
+TextBox.MultiLine = true
+TextBox.Parent = Frame
+
+-- Copy Button
+local CopyButton = Instance.new("TextButton")
+CopyButton.Size = UDim2.new(0, 100, 0, 30)
+CopyButton.Position = UDim2.new(1, -110, 1, -40)
+CopyButton.Text = "Copy"
+CopyButton.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+CopyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+CopyButton.Parent = Frame
+
+-- Notification Label
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Size = UDim2.new(0, 200, 0, 30)
+StatusLabel.Position = UDim2.new(0, 10, 1, -40)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+StatusLabel.Text = ""
+StatusLabel.Parent = Frame
+
+-- Copy Function
+CopyButton.MouseButton1Click:Connect(function()
+	if setclipboard then
+		setclipboard(TextBox.Text)
+		StatusLabel.Text = "Copied to clipboard!"
+	else
+		StatusLabel.Text = "Clipboard not supported."
+	end
+	
+	-- Clear message after 2 seconds
+	task.delay(2, function()
+		StatusLabel.Text = ""
+	end)
+end)
