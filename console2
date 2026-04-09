@@ -1,0 +1,68 @@
+-- Create ScreenGui
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "ConsoleUI"
+ScreenGui.Parent = game.Players.LocalPlayer:WaitForChild("PlayerGui")
+
+-- Main Frame
+local Frame = Instance.new("Frame")
+Frame.Size = UDim2.new(0, 500, 0, 300)
+Frame.Position = UDim2.new(0.5, -250, 0.5, -150)
+Frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+Frame.Parent = ScreenGui
+
+-- TextBox (Console Output)
+local TextBox = Instance.new("TextBox")
+TextBox.Size = UDim2.new(1, -20, 1, -60)
+TextBox.Position = UDim2.new(0, 10, 0, 10)
+TextBox.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+TextBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+TextBox.TextXAlignment = Enum.TextXAlignment.Left
+TextBox.TextYAlignment = Enum.TextYAlignment.Top
+TextBox.MultiLine = true
+TextBox.ClearTextOnFocus = false
+TextBox.TextWrapped = false
+TextBox.Text = ""
+TextBox.Parent = Frame
+
+-- Copy Button
+local CopyButton = Instance.new("TextButton")
+CopyButton.Size = UDim2.new(0, 100, 0, 30)
+CopyButton.Position = UDim2.new(1, -110, 1, -40)
+CopyButton.Text = "Copy"
+CopyButton.Parent = Frame
+
+-- Function to add text
+local function addLine(text)
+	TextBox.Text = TextBox.Text .. text .. "\n"
+	TextBox.CursorPosition = #TextBox.Text + 1
+end
+
+-- Hook print/warn/error
+local oldPrint = print
+local oldWarn = warn
+local oldError = error
+
+print = function(...)
+	local msg = table.concat({...}, " ")
+	addLine("[PRINT] " .. msg)
+	oldPrint(...)
+end
+
+warn = function(...)
+	local msg = table.concat({...}, " ")
+	addLine("[WARN] " .. msg)
+	oldWarn(...)
+end
+
+error = function(...)
+	local msg = table.concat({...}, " ")
+	addLine("[ERROR] " .. msg)
+	oldError(...)
+end
+
+-- Copy button
+CopyButton.MouseButton1Click:Connect(function()
+	if setclipboard then
+		setclipboard(TextBox.Text)
+	end
+end)
