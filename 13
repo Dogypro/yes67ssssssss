@@ -1,0 +1,411 @@
+--[[
+AUTO RAID v64
+
+Lag fix: _G.__AR_CLEANUP stores all connections.
+On re-run, disconnects EVERYTHING from previous run first.
+No more stacking connections.
+
+Difficulty: applies to NEXT raid creation (can't change current raid).
+]]
+
+-- ============================================================
+-- CLEANUP: disconnect all old connections from previous runs
+-- ============================================================
+if _G.__AR_CLEANUP then
+	pcall(function()
+		for _, conn in _G.__AR_CLEANUP do
+			pcall(function() conn:Disconnect() end)
+		end
+	end)
+	_G.__AR_RUN = false -- stop old main loop
+	_G.__AR_TAP = false -- stop old tap loops
+	task.wait(0.2) -- let old threads die
+end
+_G.__AR_CLEANUP = {}
+_G.__AR_RUN = true
+_G.__AR_TAP = false
+
+local CONNS = _G.__AR_CLEANUP
+local function track(conn) table.insert(CONNS, conn) return conn end
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RS = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+track(player.CharacterAdded:Connect(function(c) char = c end))
+
+local Net = RS:WaitForChild("Network")
+local room = 0
+local done = false
+local tapOn = false
+local showTimer = false
+local raidStart = 0
+local raids = 0
+local chestsDone = false
+local creatingRaid = false
+local burst = 1
+local killFX = false
+local bossData = {}
+local doBosses = true
+_G.__AR_DIFF = _G.__AR_DIFF or 45000
+
+local ROOM_POS = {
+	Vector3.new(-467,108,-5702), Vector3.new(-305,108,-5702),
+	Vector3.new(-144,108,-5702), Vector3.new(17,108,-5702),
+	Vector3.new(175,108,-5702), Vector3.new(334,108,-5702),
+	Vector3.new(495,108,-5702), Vector3.new(655,108,-5702),
+	Vector3.new(814,108,-5702), Vector3.new(966,108,-5700),
+}
+local BOSS_POS = { Vector3.new(-82,108,-5941), Vector3.new(833,108,-6009), Vector3.new(1146,113,-5438) }
+local CHEST_POS = Vector3.new(1134, 108, -5700)
+local BURST_OPTIONS = {1, 5, 10, 25, 50, 100, math.huge}
+
+local SignalMod, RaidCmds, ClientRaidInstance, RaidTypes, InstancingCmds, NetworkMod
+local modulesOk = true
+local function tryReq(p) local ok, m = pcall(require, p) if ok then return m end modulesOk = false return nil end
+SignalMod = tryReq(RS.Library.Signal)
+RaidCmds = tryReq(RS.Library.Client.RaidCmds)
+ClientRaidInstance = tryReq(RS.Library.Client.RaidCmds.ClientRaidInstance)
+RaidTypes = tryReq(RS.Library.Types.Raids)
+InstancingCmds = tryReq(RS.Library.Client.InstancingCmds)
+NetworkMod = tryReq(RS.Library.Client.Network)
+
+local function rf(n) return Net:FindFirstChild(n) end
+
+local rid = 0
+if NetworkMod then
+	track(pcall(function() return NetworkMod.Fired("PrivateInstance_Join"):Connect(function(d) if d then room=0 done=false chestsDone=false creatingRaid=false raidStart=tick() bossData={} if d.Id then rid=d.Id end if d.Data and d.Data.Bosses then bossData=d.Data.Bosses end end end) end) or nil)
+	track(pcall(function() return NetworkMod.Fired("Raid: Spawned Room"):Connect(function(n) room=n end) end) or nil)
+	track(pcall(function() return NetworkMod.Fired("Raid: Completed"):Connect(function() done=true end) end) or nil)
+	track(pcall(function() return NetworkMod.Fired("PrivateInstance_Data"):Connect(function(id,key,data) if id==rid and key=="Bosses" then bossData=data end end) end) or nil)
+end
+pcall(function() track(rf("PrivateInstance_Join").OnClientEvent:Connect(function(d) if d then room=0 done=false chestsDone=false creatingRaid=false raidStart=tick() bossData={} if d.Id then rid=d.Id end if d.Data and d.Data.Bosses then bossData=d.Data.Bosses end end end)) end)
+pcall(function() track(rf("Raid: Spawned Room").OnClientEvent:Connect(function(n) room=n end)) end)
+pcall(function() track(rf("Raid: Completed").OnClientEvent:Connect(function() done=true end)) end)
+pcall(function() track(rf("PrivateInstance_Data").OnClientEvent:Connect(function(id,key,data) if id==rid and key=="Bosses" then bossData=data end end)) end)
+
+local function loc()
+	local ok, r = pcall(function()
+		local a = workspace.__THINGS.__INSTANCE_CONTAINER.Active
+		if a:FindFirstChild("LuckyRaid") then return "R" end
+		if a:FindFirstChild("LuckyEventWorld") then return "E" end
+	end)
+	return ok and r or "?"
+end
+
+local function tp(pos) pcall(function() local c=player.Character if c then local h=c:FindFirstChild("HumanoidRootPart") if h then h.CFrame=CFrame.new(pos.X, 108, pos.Z) end end end) end
+
+-- Kill FX
+local FX_CLASSES = {"ParticleEmitter","Trail","Beam","Fire","Smoke","Sparkles","Sound","PointLight","SpotLight","SurfaceLight","BillboardGui","SurfaceGui","Decal","Texture"}
+local function nukeInstance(obj) for _, cls in FX_CLASSES do if obj:IsA(cls) then if obj:IsA("Sound") then pcall(function() obj.Volume=0 obj:Stop() end) elseif obj:IsA("Decal") or obj:IsA("Texture") then pcall(function() obj.Transparency=1 end) else pcall(function() obj.Enabled=false end) end return end end end
+
+local function enableFXKiller()
+	pcall(function() for _, obj in workspace:GetDescendants() do nukeInstance(obj) end end)
+	pcall(function() game:GetService("Lighting").GlobalShadows=false end)
+	pcall(function() settings().Rendering.QualityLevel=Enum.QualityLevel.Level01 end)
+	track(workspace.DescendantAdded:Connect(function(obj) if killFX then task.defer(function() nukeInstance(obj) end) end end))
+	pcall(function() track(player.PlayerGui.DescendantAdded:Connect(function(obj) if killFX then task.defer(function() if obj:IsA("ImageLabel") or obj:IsA("Frame") then pcall(function() obj.Visible=false end) end nukeInstance(obj) end) end end)) end)
+end
+
+-- Death cancel + instant tap on spawn
+track(pcall(function() return workspace.__THINGS.DescendantAdded:Connect(function(obj)
+	if obj:IsA("Model") and obj:GetAttribute("BreakableUID") then
+		pcall(function() track(obj:GetAttributeChangedSignal("Health"):Connect(function()
+			local hp = obj:GetAttribute("Health")
+			if hp and hp <= 0 then pcall(function() for _, p in obj:GetDescendants() do if p:IsA("BasePart") then p.Transparency=1 p.CanCollide=false end end end) end
+		end)) end)
+		if _G.__AR_TAP and SignalMod then
+			local uid = obj:GetAttribute("BreakableUID")
+			if uid then local n = burst if n == math.huge then n = 999 end for _ = 1, n do SignalMod.Fire("AutoClicker_Nearby", uid) end end
+		end
+		if killFX then task.defer(function() pcall(function() for _, d in obj:GetDescendants() do nukeInstance(d) end end) end) end
+	end
+end) end) or nil)
+
+-- Scan
+local function getBreakablePosition(model) for _, p in model:GetChildren() do if p:IsA("BasePart") then return p.Position end end return nil end
+
+local function scanForTP()
+	local myPos = Vector3.new(0,108,-5700)
+	pcall(function() myPos = player.Character.HumanoidRootPart.Position end)
+	local best, bestDist = nil, math.huge
+	local total, aliveCount = 0, 0
+	for _, folder in {"Breakables","AnimatedBreakables"} do
+		pcall(function()
+			for _, b in workspace.__THINGS[folder]:GetChildren() do
+				if b:GetAttribute("BreakableUID") then
+					total = total + 1
+					local hp = b:GetAttribute("Health") if not hp or hp > 0 then aliveCount = aliveCount + 1 end
+					local pos = getBreakablePosition(b)
+					if pos then local d = (pos - myPos).Magnitude if d < bestDist then best = pos bestDist = d end end
+				end
+			end
+		end)
+	end
+	return best, bestDist, total, aliveCount
+end
+
+-- Tap loop (checks _G.__AR_TAP so old loops die on re-run)
+local function tapWorker(offset)
+	task.wait(offset)
+	while _G.__AR_TAP do
+		pcall(function()
+			if not SignalMod then return end
+			local n = burst if n == math.huge then n = 999 end
+			for _, folder in {"Breakables","AnimatedBreakables"} do
+				pcall(function()
+					for _, b in workspace.__THINGS[folder]:GetChildren() do
+						local uid = b:GetAttribute("BreakableUID")
+						if uid then for _ = 1, n do SignalMod.Fire("AutoClicker_Nearby", uid) end end
+					end
+				end)
+			end
+			pcall(function() rf("Click"):FireServer() end)
+		end)
+		task.wait(0.06)
+	end
+end
+
+-- Boss
+local function bossCompleted(idx) return bossData[idx] and bossData[idx].Completed == true end
+local function bossSpawned(idx) return bossData[idx] and bossData[idx].Spawned == true end
+local function getBossTargetPos(idx) if bossData[idx] and bossData[idx].TargetPosition then return bossData[idx].TargetPosition + Vector3.new(0,3,0) end return BOSS_POS[idx] end
+
+local function doBoss(idx)
+	if bossCompleted(idx) then return end
+	tp(BOSS_POS[idx]) task.wait(0.1)
+	pcall(function() for _, d in workspace.__THINGS:GetDescendants() do if d:IsA("ClickDetector") then fireclickdetector(d) end end end)
+	pcall(function() rf("Levers_RequestPull"):FireServer(idx) end)
+	task.wait(0.1)
+	pcall(function() for _, d in workspace.__THINGS:GetDescendants() do if d:IsA("ClickDetector") then fireclickdetector(d) end end end)
+	task.spawn(function() pcall(function() rf("Raids_BossChallenge"):InvokeServer(idx) end) end)
+	task.wait(0.15)
+	task.spawn(function() pcall(function() rf("Raids_StartBoss"):InvokeServer(idx) end) end)
+	local t = tick()
+	while not bossSpawned(idx) and not bossCompleted(idx) and (tick()-t) < 3 do task.wait(0.1) end
+	if bossCompleted(idx) then return end
+	local timeout = (idx == 3) and 10 or 3
+	local bossBurst = (idx == 3) and 25 or math.max(burst, 10)
+	local bt = tick()
+	while not bossCompleted(idx) and (tick()-bt) < timeout do
+		local p = getBossTargetPos(idx) if p then tp(p) end
+		if SignalMod then pcall(function() for _, folder in {"Breakables","AnimatedBreakables"} do pcall(function() for _, b in workspace.__THINGS[folder]:GetChildren() do local uid = b:GetAttribute("BreakableUID") if uid then for _ = 1, bossBurst do SignalMod.Fire("AutoClicker_Nearby", uid) end end end end) end end) end
+		pcall(function() for _, d in workspace.__THINGS:GetDescendants() do if d:IsA("ClickDetector") then fireclickdetector(d) end end end)
+		pcall(function() rf("Click"):FireServer() end)
+		task.wait(0.05)
+	end
+	if bossCompleted(idx) then local p = getBossTargetPos(idx) if p then tp(p) end task.wait(0.5) end
+end
+
+-- Chests + Creation
+local function openChestsAndCreate()
+	local ct = ""
+	pcall(function() local cur = ClientRaidInstance.GetCurrent() if cur then ct = cur._ct or "" end end)
+	if NetworkMod and ct ~= "" then
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "Tier1000Chest", ct) end) end)
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "LootChest", ct) end) end)
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "HugeChest", ct) end) end)
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "TitanicChest", ct) end) end)
+		task.spawn(function() pcall(function() NetworkMod.Invoke("Raids_CollectReward", "LeprechaunChest", ct) end) end)
+	else
+		task.spawn(function() pcall(function() rf("Raids_OpenChest"):InvokeServer("LootChest") end) end)
+		task.spawn(function() pcall(function() rf("Raids_OpenChest"):InvokeServer("HugeChest") end) end)
+		task.spawn(function() pcall(function() rf("Raids_OpenChest"):InvokeServer("TitanicChest") end) end)
+		task.spawn(function() pcall(function() rf("Raids_OpenChest"):InvokeServer("Tier1000Chest") end) end)
+		task.spawn(function() pcall(function() rf("Raids_OpenChest"):InvokeServer("LeprechaunChest") end) end)
+		task.spawn(function() pcall(function() rf("Raids_CollectReward"):InvokeServer() end) end)
+	end
+	if modulesOk then
+		creatingRaid = true
+		local function doCreate()
+			local pm = 1 pcall(function() pm = RaidTypes.PartyMode.Solo end)
+			local portal pcall(function() local ok, p = pcall(SignalMod.Invoke, "Get Portal Number") if ok and p then portal = p end end)
+			if not portal then pcall(function() for i = 1, 10 do if not ClientRaidInstance.GetByPortal(i) then portal = i break end end end) end
+			if not portal then creatingRaid = false return end
+			local ok, s, m, raid = pcall(RaidCmds.Create, { Portal = portal, Difficulty = _G.__AR_DIFF, PartyMode = pm })
+			if ok and s and raid then pcall(raid.Join, raid) end
+			print("[AR] Created raid diff=" .. tostring(_G.__AR_DIFF))
+			creatingRaid = false
+		end
+		local inInst = false pcall(function() inInst = InstancingCmds.IsInInstance() end)
+		if inInst then pcall(function() InstancingCmds.Leave(false, true, function() doCreate() end) end)
+		else doCreate() end
+	end
+end
+
+-- Anti-AFK
+task.spawn(function()
+	local VIM pcall(function() VIM = game:GetService("VirtualInputManager") end)
+	while _G.__AR_RUN do
+		if VIM then pcall(function() local vp = workspace.CurrentCamera.ViewportSize VIM:SendMouseButtonEvent(vp.X/2, vp.Y/2, 0, true, game, 0) task.wait(0.05) VIM:SendMouseButtonEvent(vp.X/2, vp.Y/2, 0, false, game, 0) end) end
+		if SignalMod then pcall(function() SignalMod.Fire("ResetIdleTimer") end) end
+		task.wait(30)
+	end
+end)
+
+-- GUI
+pcall(function() game:GetService("CoreGui"):FindFirstChild("AR64"):Destroy() end)
+pcall(function() player.PlayerGui:FindFirstChild("AR64"):Destroy() end)
+local guiParent
+local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name = "AR64" g.Parent = game:GetService("CoreGui") guiParent = g end)
+if not ok1 then
+	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name = "AR64" g.Parent = gethui() guiParent = g end)
+	if not ok2 then local g = Instance.new("ScreenGui") g.Name = "AR64" g.ResetOnSpawn = false g.Parent = player.PlayerGui guiParent = g end
+end
+guiParent.ResetOnSpawn = false
+
+local fr = Instance.new("Frame") fr.Size = UDim2.new(0, 195, 0, 365) fr.Position = UDim2.new(0, 10, 0.5, -182) fr.BackgroundColor3 = Color3.fromRGB(15, 15, 15) fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+
+local dragging, dragStart, startPos
+track(fr.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true dragStart = input.Position startPos = fr.Position
+		input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then dragging = false end end)
+	end
+end))
+track(UIS.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+	end
+end))
+
+local yy = 4
+local function lbl(t, c, s) local l = Instance.new("TextLabel") l.Size = UDim2.new(1, -10, 0, 14) l.Position = UDim2.new(0, 5, 0, yy) l.BackgroundTransparency = 1 l.Text = t l.TextColor3 = c or Color3.fromRGB(190, 190, 190) l.TextSize = s or 11 l.Font = Enum.Font.Gotham l.TextXAlignment = Enum.TextXAlignment.Left l.Parent = fr yy = yy + 15 return l end
+local function mbtn(t, c) local b = Instance.new("TextButton") b.Size = UDim2.new(1, -10, 0, 22) b.Position = UDim2.new(0, 5, 0, yy) b.BackgroundColor3 = c b.Text = t b.TextColor3 = Color3.new(1, 1, 1) b.TextSize = 12 b.Font = Enum.Font.GothamBold b.Parent = fr Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5) yy = yy + 25 return b end
+
+lbl("RAID BOOST v64", Color3.new(1, 1, 1), 14).Font = Enum.Font.GothamBold
+local myLevel = 0
+pcall(function() myLevel = RaidCmds.GetLevel() end)
+local diffLabel = lbl("Lvl:" .. myLevel .. " | Diff:" .. _G.__AR_DIFF, Color3.fromRGB(255, 200, 0), 9)
+local sL = lbl("OFF") local rL = lbl("--") local dL = lbl("", Color3.fromRGB(255, 200, 80), 9) local tL = lbl("", Color3.fromRGB(100, 200, 255), 9)
+
+local tapB = mbtn("360° Tap: OFF", Color3.fromRGB(50, 50, 50))
+tapB.MouseButton1Click:Connect(function()
+	tapOn = not tapOn
+	_G.__AR_TAP = tapOn
+	tapB.Text = "360° Tap: " .. (tapOn and "ON" or "OFF")
+	tapB.BackgroundColor3 = tapOn and Color3.fromRGB(200, 80, 0) or Color3.fromRGB(50, 50, 50)
+	if tapOn then task.spawn(tapWorker, 0) task.spawn(tapWorker, 0.03) end
+end)
+
+local burstIdx = 1
+local burstB = mbtn("Burst: 1x", Color3.fromRGB(100, 0, 150))
+burstB.MouseButton1Click:Connect(function()
+	burstIdx = burstIdx % #BURST_OPTIONS + 1
+	burst = BURST_OPTIONS[burstIdx]
+	burstB.Text = "Burst: " .. (burst == math.huge and "INF" or tostring(burst)) .. "x"
+end)
+
+local fxB = mbtn("Kill FX: OFF", Color3.fromRGB(50, 50, 50))
+fxB.MouseButton1Click:Connect(function()
+	killFX = not killFX
+	fxB.Text = "Kill FX: " .. (killFX and "ON" or "OFF")
+	fxB.BackgroundColor3 = killFX and Color3.fromRGB(180, 0, 0) or Color3.fromRGB(50, 50, 50)
+	if killFX then enableFXKiller() end
+end)
+
+local bossB = mbtn("Bosses: ON", Color3.fromRGB(0, 100, 180))
+bossB.MouseButton1Click:Connect(function()
+	doBosses = not doBosses
+	bossB.Text = "Bosses: " .. (doBosses and "ON" or "OFF")
+	bossB.BackgroundColor3 = doBosses and Color3.fromRGB(0, 100, 180) or Color3.fromRGB(50, 50, 50)
+end)
+
+local DIFF_OPTIONS = {1000, 5000, 15000, 25000, 35000, 45000, 50000}
+local diffIdx = 6
+for i, v in DIFF_OPTIONS do if v == _G.__AR_DIFF then diffIdx = i break end end
+local diffB = mbtn("Diff: " .. _G.__AR_DIFF, Color3.fromRGB(130, 100, 0))
+diffB.MouseButton1Click:Connect(function()
+	diffIdx = diffIdx % #DIFF_OPTIONS + 1
+	_G.__AR_DIFF = DIFF_OPTIONS[diffIdx]
+	diffB.Text = "Diff: " .. tostring(_G.__AR_DIFF)
+	diffLabel.Text = "Lvl:" .. myLevel .. " | Diff:" .. _G.__AR_DIFF
+	print("[AR] Difficulty set to " .. tostring(_G.__AR_DIFF))
+end)
+
+local timerB = mbtn("Timer: OFF", Color3.fromRGB(50, 50, 50))
+timerB.MouseButton1Click:Connect(function() showTimer = not showTimer timerB.Text = "Timer: " .. (showTimer and "ON" or "OFF") timerB.BackgroundColor3 = showTimer and Color3.fromRGB(0, 130, 130) or Color3.fromRGB(50, 50, 50) if not showTimer then tL.Text = "" end end)
+
+local goB = mbtn("START", Color3.fromRGB(0, 150, 0))
+
+local function st(t) sL.Text = t end
+local function rm(t) rL.Text = t end
+local function db(t) dL.Text = t end
+
+-- Main loop
+local RUN = false
+local function boostLoop()
+	local emptyTime = 0
+	local sawBreakables = false
+	local lastRoom = 0
+	local preTped = false
+	local boss1Done, boss2Done, boss3Done = false, false, false
+
+	while RUN and _G.__AR_RUN do
+		pcall(function()
+			local l = loc()
+			local inRaid = (l == "R")
+			if showTimer and raidStart > 0 and inRaid then tL.Text = string.format("%.0fs", tick() - raidStart) end
+
+			if not inRaid and not creatingRaid then
+				st("Waiting...") db("loc=" .. l)
+				chestsDone = false done = false emptyTime = 0 sawBreakables = false lastRoom = 0 preTped = false
+				boss1Done = false boss2Done = false boss3Done = false bossData = {}
+				task.wait(0.5) return
+			end
+			if creatingRaid then st("Creating...") db("transitioning") task.wait(0.3) return end
+
+			local r = room if r < 1 then r = 1 end
+			if r ~= lastRoom then
+				lastRoom = r preTped = false sawBreakables = false emptyTime = 0
+				if doBosses and r > 3 and not boss1Done then boss1Done = true st("Boss 1!") pcall(doBoss, 1) end
+				if doBosses and r > 9 and not boss2Done then boss2Done = true st("Boss 2!") pcall(doBoss, 2) end
+			end
+
+			if not done then
+				local nearPos, nearDist, total, aliveCount = scanForTP()
+				st("Room " .. r) rm(aliveCount .. "/" .. total)
+				if total > 0 and nearPos then
+					sawBreakables = true emptyTime = 0 preTped = false
+					if r >= 4 then tp(nearPos) end
+					db("d=" .. string.format("%.0f", nearDist))
+				elseif total == 0 then
+					if sawBreakables then emptyTime = emptyTime + 0.05 end
+					if not preTped then
+						if r < 10 and ROOM_POS[r+1] then tp(ROOM_POS[r+1]) preTped = true db("PRE-TP r" .. (r+1))
+						elseif r >= 10 then tp(CHEST_POS) preTped = true db("PRE-TP chests") end
+					else db("wait " .. string.format("%.1f", emptyTime) .. "s") end
+					if r >= 10 and sawBreakables and emptyTime > 1.5 then done = true end
+				end
+			elseif not chestsDone then
+				if doBosses and not boss3Done then boss3Done = true st("Boss 3!") pcall(doBoss, 3) end
+				st("Chests!") tp(CHEST_POS)
+				chestsDone = true raids = raids + 1
+				if showTimer and raidStart > 0 then tL.Text = string.format("Last: %.0fs", tick() - raidStart) end
+				rm("Raids: " .. raids)
+				task.spawn(openChestsAndCreate)
+			else
+				st("Next raid...") db(creatingRaid and "creating" or "waiting")
+			end
+		end)
+		task.wait(0.05)
+	end
+end
+
+goB.MouseButton1Click:Connect(function()
+	RUN = not RUN
+	if RUN then
+		raidStart = tick() raids = 0 room = 0 done = false chestsDone = false creatingRaid = false bossData = {}
+		goB.Text = "STOP" goB.BackgroundColor3 = Color3.fromRGB(180, 0, 0)
+		task.spawn(function()
+			while RUN and _G.__AR_RUN do pcall(boostLoop) if RUN then task.wait(2) end end
+			st("OFF") rm("--") db("") tL.Text = ""
+		end)
+	else
+		goB.Text = "START" goB.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
+		tapOn = false _G.__AR_TAP = false tapB.Text = "360° Tap: OFF" tapB.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+	end
+end)
