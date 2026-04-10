@@ -1,0 +1,25 @@
+-- Run this OUTSIDE a raid, in event world
+_G.__AR_DIFF = 1000
+warn("Difficulty set to: " .. tostring(_G.__AR_DIFF))
+
+-- Now check: does the console show "[AR] Created raid at difficulty 1000" when the next raid starts?
+-- If NOT, our script isn't creating the raid — the in-game auto raid is.
+
+-- To verify, manually create one:
+local RS = game:GetService("ReplicatedStorage")
+local RaidCmds = require(RS.Library.Client.RaidCmds)
+local RaidTypes = require(RS.Library.Types.Raids)
+local ClientRaidInstance = require(RS.Library.Client.RaidCmds.ClientRaidInstance)
+
+local portal
+for i = 1, 10 do
+    if not ClientRaidInstance.GetByPortal(i) then portal = i break end
+end
+
+warn("Creating at difficulty 1000, portal " .. tostring(portal))
+local ok, s, m, raid = pcall(RaidCmds.Create, {Portal = portal, Difficulty = 1000, PartyMode = RaidTypes.PartyMode.Solo})
+warn("Result:", ok, s, m, raid)
+if ok and s and raid then
+    pcall(raid.Join, raid)
+    warn("JOINED! Check if breakables die in 1 hit at burst=1")
+end
