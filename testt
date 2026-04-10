@@ -1,0 +1,93 @@
+local output = {}
+local count = 0
+local function add(s) table.insert(output, tostring(s)) count = count + 1 end
+
+local function dumpTree(obj, depth, maxDepth)
+	local indent = string.rep("  ", depth)
+	local info = indent .. obj.ClassName .. " | " .. obj.Name
+
+	pcall(function()
+		local attrs = obj:GetAttributes()
+		if next(attrs) then
+			for k, v in pairs(attrs) do
+				info = info .. " [" .. k .. "=" .. tostring(v) .. "]"
+			end
+		end
+	end)
+
+	add(info)
+
+	if obj:IsA("ModuleScript") or obj:IsA("LocalScript") then
+		pcall(function()
+			local src = decompile(obj)
+			if src and #src > 0 then
+				add(indent .. "  === SOURCE START (" .. obj:GetFullName() .. ") ===")
+				for line in src:gmatch("[^\n]*") do
+					add(indent .. "  " .. line)
+				end
+				add(indent .. "  === SOURCE END ===")
+			end
+		end)
+	end
+
+	if depth < maxDepth then
+		pcall(function()
+			for _, child in obj:GetChildren() do
+				dumpTree(child, depth + 1, maxDepth)
+			end
+		end)
+	end
+end
+
+add("========== NETWORK REMOTES ==========")
+pcall(function()
+	for _, c in game.ReplicatedStorage.Network:GetChildren() do
+		add(c.ClassName .. " | " .. c.Name)
+	end
+end)
+
+add("\n========== REPLICATED STORAGE ==========")
+pcall(function() dumpTree(game.ReplicatedStorage, 0, 99) end)
+
+add("\n========== REPLICATED FIRST ==========")
+pcall(function() dumpTree(game.ReplicatedFirst, 0, 99) end)
+
+add("\n========== STARTER PLAYER ==========")
+pcall(function() dumpTree(game.StarterPlayer, 0, 99) end)
+
+add("\n========== STARTER GUI ==========")
+pcall(function() dumpTree(game.StarterGui, 0, 99) end)
+
+add("\n========== WORKSPACE.__THINGS ==========")
+pcall(function() dumpTree(workspace.__THINGS, 0, 5) end)
+
+add("\n========== LIGHTING ==========")
+pcall(function() dumpTree(game:GetService("Lighting"), 0, 99) end)
+
+add("\n========== PLAYER SCRIPTS ==========")
+pcall(function() dumpTree(game.Players.LocalPlayer.PlayerScripts, 0, 99) end)
+
+add("\n========== PLAYER GUI ==========")
+pcall(function() dumpTree(game.Players.LocalPlayer.PlayerGui, 0, 3) end)
+
+local result = table.concat(output, "\n")
+warn("TOTAL LINES: " .. count)
+
+-- Save as multiple files if too big
+local chunkSize = 200000 -- chars per file
+if #result > chunkSize then
+	local fileNum = 1
+	local pos = 1
+	while pos <= #result do
+		local chunk = string.sub(result, pos, pos + chunkSize - 1)
+		pcall(function() writefile("raid_dump_" .. fileNum .. ".txt", chunk) end)
+		warn("SAVED raid_dump_" .. fileNum .. ".txt (" .. #chunk .. " chars)")
+		fileNum = fileNum + 1
+		pos = pos + chunkSize
+	end
+else
+	pcall(function() writefile("raid_dump.txt", result) warn("SAVED raid_dump.txt") end)
+end
+
+pcall(function() setclipboard(result) warn("COPIED to clipboard") end)
+warn("DONE - " .. #result .. " total characters")
