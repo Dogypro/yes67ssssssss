@@ -1,0 +1,74 @@
+local printed = 0
+local function out(s)
+	print(s)
+	printed = printed + 1
+	if printed % 500 == 0 then task.wait() end -- yield every 500 lines to prevent crash
+end
+
+local function dumpTree(obj, depth, maxDepth)
+	local indent = string.rep("  ", depth)
+	local info = indent .. obj.ClassName .. " | " .. obj.Name
+
+	pcall(function()
+		local attrs = obj:GetAttributes()
+		if next(attrs) then
+			for k, v in pairs(attrs) do
+				info = info .. " [" .. k .. "=" .. tostring(v) .. "]"
+			end
+		end
+	end)
+
+	out(info)
+
+	if obj:IsA("ModuleScript") or obj:IsA("LocalScript") then
+		pcall(function()
+			local src = decompile(obj)
+			if src and #src > 0 then
+				out(indent .. "  === SOURCE START (" .. obj:GetFullName() .. ") ===")
+				for line in src:gmatch("[^\n]*") do
+					out(indent .. "  " .. line)
+				end
+				out(indent .. "  === SOURCE END ===")
+			end
+		end)
+	end
+
+	if depth < maxDepth then
+		pcall(function()
+			for _, child in obj:GetChildren() do
+				dumpTree(child, depth + 1, maxDepth)
+			end
+		end)
+	end
+end
+
+warn("=== STARTING DUMP ===")
+
+out("========== NETWORK REMOTES ==========")
+pcall(function() for _, c in game.ReplicatedStorage.Network:GetChildren() do out(c.ClassName .. " | " .. c.Name) end end)
+w
+out("========== REPLICATED STORAGE ==========")
+pcall(function() dumpTree(game.ReplicatedStorage, 0, 99) end)
+
+out("========== REPLICATED FIRST ==========")
+pcall(function() dumpTree(game.ReplicatedFirst, 0, 99) end)
+
+out("========== STARTER PLAYER ==========")
+pcall(function() dumpTree(game.StarterPlayer, 0, 99) end)
+
+out("========== STARTER GUI ==========")
+pcall(function() dumpTree(game.StarterGui, 0, 99) end)
+
+out("========== WORKSPACE.__THINGS ==========")
+pcall(function() dumpTree(workspace.__THINGS, 0, 5) end)
+
+out("========== LIGHTING ==========")
+pcall(function() dumpTree(game:GetService("Lighting"), 0, 99) end)
+
+out("========== PLAYER SCRIPTS ==========")
+pcall(function() dumpTree(game.Players.LocalPlayer.PlayerScripts, 0, 99) end)
+
+out("========== PLAYER GUI ==========")
+pcall(function() dumpTree(game.Players.LocalPlayer.PlayerGui, 0, 3) end)
+
+warn("=== DONE === " .. printed .. " lines printed")
