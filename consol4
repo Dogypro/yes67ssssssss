@@ -1,0 +1,78 @@
+local printed = 0
+local chunks = {}
+local cur = {}
+local failed = 0
+
+local function out(s)
+	s = tostring(s)
+	print(s)
+	table.insert(cur, s)
+	printed = printed + 1
+	if #cur >= 5000 then
+		table.insert(chunks, table.concat(cur, "\n"))
+		cur = {}
+	end
+	if printed % 200 == 0 then task.wait() end
+end
+
+local function tryDecompile(obj)
+	local src = nil
+	local ok = pcall(function()
+		src = decompile(obj)
+	end)
+	if not ok or not src or #src < 10 then
+		failed = failed + 1
+		out("=== SKIP (obfuscated): " .. obj:GetFullName() .. " ===")
+		return
+	end
+	-- Verify it's not malformed by checking for common lua patterns
+	out("=== SOURCE: " .. obj:GetFullName() .. " ===")
+	for line in src:gmatch("[^\n]*") do
+		out(line)
+	end
+	out("=== END ===")
+end
+
+local function scanAll(root, name)
+	out("\n########## " .. name .. " ##########")
+	local scripts = {}
+	pcall(function()
+		for _, obj in root:GetDescendants() do
+			if obj:IsA("ModuleScript") or obj:IsA("LocalScript") or obj:IsA("Script") then
+				table.insert(scripts, obj)
+			end
+		end
+	end)
+	out("Found " .. #scripts .. " scripts")
+	for i, obj in scripts do
+		pcall(function()
+			out("\n--- [" .. i .. "/" .. #scripts .. "] ---")
+			tryDecompile(obj)
+		end)
+		if i % 10 == 0 then warn("[PROGRESS] " .. name .. ": " .. i .. "/" .. #scripts .. " (failed: " .. failed .. ")") end
+	end
+end
+
+warn("=== STARTING (skip obfuscated scripts) ===")
+
+pcall(function() scanAll(game.ReplicatedStorage, "REPLICATED STORAGE") end)
+pcall(function() scanAll(game.StarterPlayer, "STARTER PLAYER") end)
+pcall(function() scanAll(workspace, "WORKSPACE") end)
+pcall(function() scanAll(game.Players.LocalPlayer.PlayerScripts, "PLAYER SCRIPTS") end)
+
+if #cur > 0 then table.insert(chunks, table.concat(cur, "\n")) cur = {} end
+
+warn("=== DONE: " .. printed .. " lines, " .. failed .. " skipped ===")
+
+local full = table.concat(chunks, "\n")
+local CHUNK = 180000
+local pos = 1
+local fileNum = 1
+while pos <= #full do
+	pcall(function() writefile("js_dump_" .. fileNum .. ".txt", string.sub(full, pos, pos + CHUNK - 1)) warn("SAVED js_dump_" .. fileNum .. ".txt") end)
+	fileNum = fileNum + 1
+	pos = pos + CHUNK
+end
+
+pcall(function() setclipboard(full) warn("COPIED clipboard") end)
+warn("=== ALL DONE === " .. #full .. " chars in " .. (fileNum-1) .. " files")
