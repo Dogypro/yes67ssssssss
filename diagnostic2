@@ -1,0 +1,58 @@
+local printed = 0
+local function out(s) print(s) printed = printed + 1 if printed % 300 == 0 then task.wait() end end
+
+local function decompAndPrint(obj)
+	pcall(function()
+		local src = decompile(obj)
+		if src and #src > 0 then
+			out("=== " .. obj:GetFullName() .. " ===")
+			for line in src:gmatch("[^\n]*") do out(line) end
+			out("=== END ===")
+		else
+			out("FAILED: " .. obj:GetFullName())
+		end
+	end)
+end
+
+local SP = game.StarterPlayer.StarterPlayerScripts
+local CH = game.Players.LocalPlayer.Character or game.Players.LocalPlayer.CharacterAdded:Wait()
+
+-- 1. HitboxController (how hits land)
+out("########## HITBOX CONTROLLER ##########")
+pcall(function() decompAndPrint(SP.Controllers.Combat.HitboxController) end)
+
+-- 2. Charles moveset (how Eye Catching works)
+out("########## CHARLES MOVESET ##########")
+pcall(function()
+	for _, obj in SP.Controllers.Moveset.Charles:GetDescendants() do
+		if obj:IsA("ModuleScript") or obj:IsA("LocalScript") then
+			decompAndPrint(obj)
+		end
+	end
+end)
+
+-- 3. All remotes in workspace + replicated (combat ones)
+out("########## ALL REMOTES ##########")
+pcall(function()
+	for _, obj in game.ReplicatedStorage:GetDescendants() do
+		if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") or obj:IsA("UnreliableRemoteEvent") or obj:IsA("BindableEvent") then
+			out(obj.ClassName .. " | " .. obj:GetFullName())
+		end
+	end
+end)
+
+-- 4. Character moveset folder + info
+out("########## CHARACTER MOVESET ##########")
+pcall(function()
+	for _, obj in CH:GetDescendants() do
+		out(obj.ClassName .. " | " .. obj.Name)
+		pcall(function()
+			local attrs = obj:GetAttributes()
+			if next(attrs) then
+				for k, v in pairs(attrs) do out("  [" .. k .. "=" .. tostring(v) .. "]") end
+			end
+		end)
+	end
+end)
+
+warn("DONE: " .. printed .. " lines")
