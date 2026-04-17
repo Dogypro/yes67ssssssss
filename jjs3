@@ -1,0 +1,147 @@
+--[[
+JS AUTO COUNTER v10 (No-BS Version)
+===================
+Stripped out all complex math, angles, and FOV checks.
+Counters instantly if you are targeted, or if an attack remote fires near you.
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.3) end
+if _G.__AC_CONNS then for _, c in _G.__AC_CONNS do pcall(function() c:Disconnect() end) end end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+local function track(c) if c then table.insert(_G.__AC_CONNS, c) end return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local VIM = game:GetService("VirtualInputManager")
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+track(player.CharacterAdded:Connect(function(c) char = c task.wait(1) connectHealth() end))
+
+local reactOn = false
+local beforeOn = false
+local counters = 0
+local lastFire = 0
+
+-- 🔴 CHANGE THIS IF IT COUNTERS TOO OFTEN FROM FAR AWAY 🔴
+local MAX_DISTANCE = 15 
+
+local EC_KEY = Enum.KeyCode.Three
+pcall(function()
+	local moveset = char:FindFirstChild("Moveset")
+	if moveset and moveset:FindFirstChild("Eye Catching") then
+		local k = moveset["Eye Catching"]:GetAttribute("Key")
+		if k == 1 then EC_KEY = Enum.KeyCode.One
+		elseif k == 2 then EC_KEY = Enum.KeyCode.Two
+		elseif k == 3 then EC_KEY = Enum.KeyCode.Three
+		elseif k == 4 then EC_KEY = Enum.KeyCode.Four end
+	end
+end)
+
+local function fireCounter()
+	if (tick() - lastFire) < 0.2 then return end
+	lastFire = tick()
+	counters = counters + 1
+
+	-- Method 1: Virtual Keypress
+	pcall(function()
+		VIM:SendKeyEvent(true, EC_KEY, false, game)
+		task.delay(0.15, function() pcall(function() VIM:SendKeyEvent(false, EC_KEY, false, game) end) end)
+	end)
+
+	-- Method 2 & 3: Direct Remote Firing
+	pcall(function()
+		local svc = RS.Knit.Knit.Services:FindFirstChild("EyeCatchService")
+		if svc and svc.RE and svc.RE:FindFirstChild("Activated") then svc.RE.Activated:FireServer() end
+	end)
+	pcall(function()
+		local svcName = char.Moveset["Eye Catching"]:GetAttribute("Service")
+		local svc = RS.Knit.Knit.Services:FindFirstChild(svcName)
+		if svc and svc.RE and svc.RE:FindFirstChild("Activated") then svc.RE.Activated:FireServer() end
+	end)
+end
+
+function connectHealth()
+	pcall(function()
+		local hum = char and char:WaitForChild("Humanoid", 5)
+		if not hum then return end
+		local lastHP = hum.Health
+		track(hum.HealthChanged:Connect(function(hp)
+			if reactOn and hp < lastHP then fireCounter() end
+			lastHP = hp
+		end))
+	end)
+end
+connectHealth()
+
+-- ============================================================
+-- THE "NO B.S." PREDICTION
+-- ============================================================
+pcall(function()
+	for _, svc in RS.Knit.Knit.Services:GetChildren() do
+		local re = svc:FindFirstChild("RE")
+		if not re or svc.Name == "EyeCatchService" then continue end
+
+		for _, remote in re:GetChildren() do
+			if not remote:IsA("RemoteEvent") then continue end
+
+			track(remote.OnClientEvent:Connect(function(effectName, ...)
+				if not beforeOn then return end
+				local args = {...}
+
+				-- 1. IF THE REMOTE EXPLICITLY TARGETS YOU = INSTANT COUNTER
+				for _, arg in args do
+					if typeof(arg) == "Instance" and (arg == char or arg == player or (char and arg:IsDescendantOf(char))) then
+						fireCounter()
+						return
+					end
+				end
+
+				-- 2. IF A COMBAT REMOTE HAPPENS NEAR YOU = INSTANT COUNTER
+				if type(effectName) == "string" then
+					local e = effectName:lower()
+					-- Catch basically any offensive action
+					if e:find("swing") or e:find("slash") or e:find("punch") or e:find("kick") or e:find("hit") or e:find("strike") or e:find("m1") or e:find("attack") then
+						local myHrp = char and char:FindFirstChild("HumanoidRootPart")
+						if not myHrp then return end
+
+						for _, arg in args do
+							if typeof(arg) == "Instance" and arg:IsA("Model") and arg ~= char then
+								local eHrp = arg:FindFirstChild("HumanoidRootPart")
+								if eHrp then
+									-- ONLY check distance. No angles, no FOV, no "who is closer".
+									if (eHrp.Position - myHrp.Position).Magnitude <= MAX_DISTANCE then
+										fireCounter()
+										return
+									end
+								end
+							end
+						end
+					end
+				end
+			end))
+		end
+	end
+end)
+
+-- ============================================================
+-- GUI (Minimal)
+-- ============================================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("AC8"):Destroy() end)
+pcall(function() player.PlayerGui:FindFirstChild("AC8"):Destroy() end)
+local g = Instance.new("ScreenGui") g.Name="AC8" g.ResetOnSpawn=false
+if not pcall(function() g.Parent=game:GetService("CoreGui") end) then
+	if not pcall(function() g.Parent=gethui() end) then g.Parent=player.PlayerGui end
+end
+
+local fr = Instance.new("Frame", g)
+fr.Size = UDim2.new(0, 160, 0, 105) fr.Position = UDim2.new(1, -170, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+local t = Instance.new("TextLabel", fr) t.Size=UDim2.new(1,0,0,20) t.Text="AUTO COUNTER v10" t.TextColor3=Color3.new(1,1,1) t.BackgroundTransparency=1
+
+local b1 = Instance.new("TextButton", fr) b1.Size=UDim2.new(1,-10,0,30) b1.Position=UDim2.new(0,5,0,30) b1.Text="React: OFF"
+b1.MouseButton1Click:Connect(function() reactOn = not reactOn b1.Text="React: "..(reactOn and "ON" or "OFF") end)
+
+local b2 = Instance.new("TextButton", fr) b2.Size=UDim2.new(1,-10,0,30) b2.Position=UDim2.new(0,5,0,65) b2.Text="Before: OFF"
+b2.MouseButton1Click:Connect(function() beforeOn = not beforeOn b2.Text="Before: "..(beforeOn and "ON" or "OFF") end)
