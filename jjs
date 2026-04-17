@@ -1,0 +1,282 @@
+--[[
+JS AUTO COUNTER v6 — Eye Catching
+===================================
+Universal detection — works for M1s, abilities, grabs, everything.
+
+Two triggers:
+  1. ANY remote effect where YOUR character is an argument = you got hit
+  2. Health drops = you took damage, counter for next hit in combo
+
+No keyword filtering. No guessing. If the game says 
+you're involved in a hit, counter activates.
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.3) end
+if _G.__AC_CONNS then for _, c in _G.__AC_CONNS do pcall(function() c:Disconnect() end) end end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+local function track(c) if c then table.insert(_G.__AC_CONNS, c) end return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local VIM pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+track(player.CharacterAdded:Connect(function(c) char = c connectHealth() end))
+
+local counterOn = false
+local counters = 0
+local lastFire = 0
+
+-- ============================================================
+-- FIRE EYE CATCHING
+-- ============================================================
+local function fireCounter()
+	if not counterOn then return end
+	if (tick() - lastFire) < 0.25 then return end
+	lastFire = tick()
+
+	-- Cancel current action so counter can activate
+	pcall(function()
+		local info = char and char:FindFirstChild("Info")
+		if info then local c = info:FindFirstChild("Cancel") if c then c:Fire() end end
+	end)
+
+	-- Press key 3
+	task.defer(function()
+		pcall(function()
+			if VIM then
+				VIM:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+				task.delay(0.07, function()
+					pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.Three, false, game) end)
+				end)
+			end
+		end)
+	end)
+
+	counters = counters + 1
+end
+
+-- ============================================================
+-- CHECK: does any arg reference my character?
+-- ============================================================
+local function argsTargetMe(args)
+	for _, arg in args do
+		if typeof(arg) == "Instance" then
+			-- Direct match: our character model or player
+			if arg == char then return true end
+			if arg == player then return true end
+			-- Part inside our character (e.g. HumanoidRootPart)
+			if char and arg:IsDescendantOf(char) then return true end
+		end
+	end
+	return false
+end
+
+-- ============================================================
+-- CHECK: is this arg an enemy model attacking near me?
+-- ============================================================
+local function isEnemySwingingAtMe(args)
+	local myHrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not myHrp then return false end
+	
+	for _, arg in args do
+		if typeof(arg) == "Instance" and arg:IsA("Model") and arg ~= char then
+			local eHrp = arg:FindFirstChild("HumanoidRootPart")
+			if eHrp then
+				local dist = (eHrp.Position - myHrp.Position).Magnitude
+				if dist <= 8 then
+					-- Close enemy — check if facing me
+					local toMe = (myHrp.Position - eHrp.Position).Unit
+					local look = eHrp.CFrame.LookVector
+					if look:Dot(toMe) > 0.3 then
+						return true
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- ============================================================
+-- CORE: Listen to ALL service effects + activated + hitbox
+-- No keyword filtering — check if WE are involved
+-- ============================================================
+pcall(function()
+	for _, svc in RS.Knit.Knit.Services:GetChildren() do
+		local re = svc:FindFirstChild("RE")
+		if not re then continue end
+		if svc.Name == "EyeCatchService" then continue end
+
+		-- EFFECTS: any effect where we are a target arg
+		local effects = re:FindFirstChild("Effects")
+		if effects and effects:IsA("RemoteEvent") then
+			track(effects.OnClientEvent:Connect(function(effectName, ...)
+				if not counterOn then return end
+				local args = {...}
+				
+				-- Our character is in the args = we are being hit/targeted
+				if argsTargetMe(args) then
+					fireCounter()
+					return
+				end
+				
+				-- Enemy model in args + they're close + facing me = about to hit me
+				if type(effectName) == "string" then
+					-- Skip pure visual effects that don't mean an attack
+					local eName = effectName:lower()
+					if eName == "despawn" or eName == "spawn" or eName == "idle" 
+						or eName == "death" or eName == "heal" or eName == "revive" then
+						return
+					end
+				end
+				
+				if isEnemySwingingAtMe(args) then
+					fireCounter()
+				end
+			end))
+		end
+
+		-- ACTIVATED: enemy used ability near me + facing me
+		local activated = re:FindFirstChild("Activated")
+		if activated and activated:IsA("RemoteEvent") then
+			track(activated.OnClientEvent:Connect(function(...)
+				if not counterOn then return end
+				local args = {...}
+				
+				-- If we're directly referenced = we're a target
+				if argsTargetMe(args) then
+					fireCounter()
+					return
+				end
+				
+				-- Enemy activated ability while close + facing me
+				if isEnemySwingingAtMe(args) then
+					fireCounter()
+				end
+			end))
+		end
+
+		-- HITBOX: direct hit event
+		local hitbox = re:FindFirstChild("Hitbox")
+		if hitbox and hitbox:IsA("RemoteEvent") then
+			track(hitbox.OnClientEvent:Connect(function(...)
+				if not counterOn then return end
+				if argsTargetMe({...}) then
+					fireCounter()
+				end
+			end))
+		end
+		
+		-- RIGHT ACTIVATED (some movesets use this)
+		local rightAct = re:FindFirstChild("RightActivated")
+		if rightAct and rightAct:IsA("RemoteEvent") then
+			track(rightAct.OnClientEvent:Connect(function(...)
+				if not counterOn then return end
+				if argsTargetMe({...}) then
+					fireCounter()
+					return
+				end
+				if isEnemySwingingAtMe({...}) then
+					fireCounter()
+				end
+			end))
+		end
+		
+		-- CHASE (some movesets have chase attacks)
+		local chase = re:FindFirstChild("Chase")
+		if chase and chase:IsA("RemoteEvent") then
+			track(chase.OnClientEvent:Connect(function(...)
+				if not counterOn then return end
+				if argsTargetMe({...}) then
+					fireCounter()
+				end
+			end))
+		end
+	end
+end)
+
+-- ============================================================
+-- BACKUP: Health drop = we took damage
+-- Counter activates so NEXT hit in combo gets countered
+-- ============================================================
+function connectHealth()
+	pcall(function()
+		local hum = char and char:WaitForChild("Humanoid", 5)
+		if not hum then return end
+		local lastHP = hum.Health
+		track(hum.HealthChanged:Connect(function(hp)
+			if not counterOn then return end
+			if hp < lastHP then
+				fireCounter()
+			end
+			lastHP = hp
+		end))
+	end)
+end
+connectHealth()
+
+-- ============================================================
+-- GUI
+-- ============================================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("AC6"):Destroy() end)
+pcall(function() player.PlayerGui:FindFirstChild("AC6"):Destroy() end)
+local guiParent
+local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC6" g.Parent=game:GetService("CoreGui") guiParent=g end)
+if not ok1 then
+	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC6" g.Parent=gethui() guiParent=g end)
+	if not ok2 then local g = Instance.new("ScreenGui") g.Name="AC6" g.ResetOnSpawn=false g.Parent=player.PlayerGui guiParent=g end
+end
+guiParent.ResetOnSpawn = false
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 150, 0, 66)
+fr.Position = UDim2.new(1, -160, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", fr).Color = Color3.fromRGB(80, 50, 100)
+
+local dragging, dragStart, startPos
+track(fr.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		dragging = true dragStart = i.Position startPos = fr.Position
+		i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+	end
+end))
+track(UIS.InputChanged:Connect(function(i)
+	if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		local d = i.Position - dragStart
+		fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end))
+
+local titleL = Instance.new("TextLabel")
+titleL.Size = UDim2.new(0.55, 0, 0, 12) titleL.Position = UDim2.new(0, 8, 0, 6)
+titleL.BackgroundTransparency = 1 titleL.Text = "EYE CATCH" titleL.TextColor3 = Color3.fromRGB(255, 180, 50)
+titleL.TextSize = 11 titleL.Font = Enum.Font.GothamBold titleL.TextXAlignment = Enum.TextXAlignment.Left titleL.Parent = fr
+
+local countL = Instance.new("TextLabel")
+countL.Size = UDim2.new(0.45, -8, 0, 12) countL.Position = UDim2.new(0.55, 0, 0, 6)
+countL.BackgroundTransparency = 1 countL.Text = "0" countL.TextColor3 = Color3.fromRGB(140, 140, 150)
+countL.TextSize = 10 countL.Font = Enum.Font.Gotham countL.TextXAlignment = Enum.TextXAlignment.Right countL.Parent = fr
+
+local toggleB = Instance.new("TextButton")
+toggleB.Size = UDim2.new(1, -14, 0, 26) toggleB.Position = UDim2.new(0, 7, 0, 24)
+toggleB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) toggleB.Text = "OFF"
+toggleB.TextColor3 = Color3.fromRGB(200, 200, 210) toggleB.TextSize = 13 toggleB.Font = Enum.Font.GothamBold
+toggleB.Parent = fr Instance.new("UICorner", toggleB).CornerRadius = UDim.new(0, 6)
+
+toggleB.MouseButton1Click:Connect(function()
+	counterOn = not counterOn
+	toggleB.Text = counterOn and "ON" or "OFF"
+	toggleB.BackgroundColor3 = counterOn and Color3.fromRGB(180, 40, 40) or Color3.fromRGB(35, 35, 45)
+	toggleB.TextColor3 = counterOn and Color3.new(1, 1, 1) or Color3.fromRGB(200, 200, 210)
+end)
+
+task.spawn(function()
+	while _G.__AC_RUN do pcall(function() countL.Text = tostring(counters) end) task.wait(0.3) end
+end)
