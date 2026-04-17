@@ -1,0 +1,221 @@
+-- ============================================
+-- AUTO COUNTER — Eye Catching (Jujutsu Shenanigans)
+-- Based on the working autoblock pattern
+-- Uses keypress/keyrelease (NOT VIM)
+-- ============================================
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+
+local counterOn = false
+local counters = 0
+local lastFire = 0
+local RANGE = 12
+
+-- Key 3 = 0x33
+local COUNTER_KEY = 0x33
+pcall(function()
+	local ec = character:FindFirstChild("Moveset") and character.Moveset:FindFirstChild("Eye Catching")
+	if ec then
+		local k = ec:GetAttribute("Key")
+		if k == 1 then COUNTER_KEY = 0x31
+		elseif k == 2 then COUNTER_KEY = 0x32
+		elseif k == 3 then COUNTER_KEY = 0x33
+		elseif k == 4 then COUNTER_KEY = 0x34 end
+	end
+end)
+
+-- Non-combat anims (idle, walk, jump, fall, climb, sit)
+local SAFE = {}
+for _, id in {"180435571","180435792","15621270146","7012721719","180436334","9442520397","178130996"} do
+	SAFE[id] = true
+end
+
+local function isCombatAnim(track)
+	if not track or not track.Animation then return true end
+	local id = track.Animation.AnimationId
+	if not id then return true end
+	local n = id:match("%d+")
+	return not (n and SAFE[n])
+end
+
+local function fireCounter()
+	if not counterOn then return end
+	if (tick() - lastFire) < 0.3 then return end
+	lastFire = tick()
+	counters = counters + 1
+	keypress(COUNTER_KEY)
+	task.delay(0.15, function() keyrelease(COUNTER_KEY) end)
+end
+
+-- ============================================
+-- MELEE: Same pattern as working autoblock
+-- + filter combat anims + facing check
+-- ============================================
+local function watchPlayer(p)
+	if p == LocalPlayer then return end
+	local function onChar(char)
+		pcall(function()
+			local animator = char:WaitForChild("Humanoid"):WaitForChild("Animator")
+			animator.AnimationPlayed:Connect(function(animTrack)
+				if not counterOn then return end
+				if not isCombatAnim(animTrack) then return end
+
+				local myChar = LocalPlayer.Character
+				if not myChar then return end
+				local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+				local theirRoot = char:FindFirstChild("HumanoidRootPart")
+				if not myRoot or not theirRoot then return end
+
+				local dist = (myRoot.Position - theirRoot.Position).Magnitude
+				if dist > RANGE then return end
+
+				local toMe = (myRoot.Position - theirRoot.Position).Unit
+				local dot = theirRoot.CFrame.LookVector:Dot(toMe)
+				if dot > 0.3 then
+					fireCounter()
+				end
+			end)
+		end)
+	end
+	if p.Character then onChar(p.Character) end
+	p.CharacterAdded:Connect(onChar)
+end
+
+for _, p in Players:GetPlayers() do watchPlayer(p) end
+Players.PlayerAdded:Connect(watchPlayer)
+
+-- ============================================
+-- PROJECTILE: parts heading toward me
+-- ============================================
+pcall(function()
+	local eff = workspace:FindFirstChild("Effects")
+	if not eff then return end
+	eff.ChildAdded:Connect(function(part)
+		if not counterOn or not part:IsA("BasePart") then return end
+		task.defer(function()
+			for _ = 1, 10 do
+				if not part.Parent then return end
+				pcall(function()
+					local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+					if not myRoot then return end
+					local dist = (part.Position - myRoot.Position).Magnitude
+					local vel = part.AssemblyLinearVelocity
+					if vel.Magnitude > 10 and dist < 15 then
+						local aimed = vel.Unit:Dot((myRoot.Position - part.Position).Unit)
+						if aimed > 0.5 and dist / vel.Magnitude < 0.2 then
+							fireCounter()
+							return
+						end
+					end
+				end)
+				task.wait(0.03)
+			end
+		end)
+	end)
+end)
+
+-- ============================================
+-- REMOTE BACKUP: confirmed target
+-- ============================================
+pcall(function()
+	for _, svc in RS.Knit.Knit.Services:GetChildren() do
+		local re = svc:FindFirstChild("RE")
+		if not re or svc.Name == "EyeCatchService" then continue end
+		for _, remote in re:GetChildren() do
+			if not remote:IsA("RemoteEvent") then continue end
+			remote.OnClientEvent:Connect(function(...)
+				if not counterOn then return end
+				local myChar = LocalPlayer.Character
+				for _, arg in {...} do
+					if typeof(arg) == "Instance" and arg == myChar then
+						fireCounter()
+						return
+					end
+				end
+			end)
+		end
+	end
+end)
+
+-- ============================================
+-- RESPAWN
+-- ============================================
+LocalPlayer.CharacterAdded:Connect(function(char)
+	character = char
+	pcall(function()
+		task.wait(1)
+		local ec = char:FindFirstChild("Moveset") and char.Moveset:FindFirstChild("Eye Catching")
+		if ec then
+			local k = ec:GetAttribute("Key")
+			if k == 1 then COUNTER_KEY = 0x31
+			elseif k == 2 then COUNTER_KEY = 0x32
+			elseif k == 3 then COUNTER_KEY = 0x33
+			elseif k == 4 then COUNTER_KEY = 0x34 end
+		end
+	end)
+end)
+
+-- ============================================
+-- GUI
+-- ============================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("ACX"):Destroy() end)
+local guiParent
+local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name="ACX" g.Parent=game:GetService("CoreGui") guiParent=g end)
+if not ok1 then
+	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name="ACX" g.Parent=gethui() guiParent=g end)
+	if not ok2 then local g = Instance.new("ScreenGui") g.Name="ACX" g.ResetOnSpawn=false g.Parent=LocalPlayer.PlayerGui guiParent=g end
+end
+guiParent.ResetOnSpawn = false
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 140, 0, 55)
+fr.Position = UDim2.new(1, -150, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", fr).Color = Color3.fromRGB(80, 50, 100)
+
+local UIS = game:GetService("UserInputService")
+local dragging, dragStart, startPos
+fr.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		dragging = true dragStart = i.Position startPos = fr.Position
+		i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+	end
+end)
+UIS.InputChanged:Connect(function(i)
+	if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		local d = i.Position - dragStart
+		fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end)
+
+local titleL = Instance.new("TextLabel")
+titleL.Size = UDim2.new(0.6, 0, 0, 12) titleL.Position = UDim2.new(0, 8, 0, 4)
+titleL.BackgroundTransparency = 1 titleL.Text = "COUNTER" titleL.TextColor3 = Color3.fromRGB(255, 180, 50)
+titleL.TextSize = 10 titleL.Font = Enum.Font.GothamBold titleL.TextXAlignment = Enum.TextXAlignment.Left titleL.Parent = fr
+
+local countL = Instance.new("TextLabel")
+countL.Size = UDim2.new(0.4, -8, 0, 12) countL.Position = UDim2.new(0.6, 0, 0, 4)
+countL.BackgroundTransparency = 1 countL.Text = "0" countL.TextColor3 = Color3.fromRGB(140, 140, 150)
+countL.TextSize = 10 countL.Font = Enum.Font.Gotham countL.TextXAlignment = Enum.TextXAlignment.Right countL.Parent = fr
+
+local toggleB = Instance.new("TextButton")
+toggleB.Size = UDim2.new(1, -14, 0, 22) toggleB.Position = UDim2.new(0, 7, 0, 20)
+toggleB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) toggleB.Text = "OFF"
+toggleB.TextColor3 = Color3.fromRGB(200, 200, 210) toggleB.TextSize = 13 toggleB.Font = Enum.Font.GothamBold
+toggleB.Parent = fr Instance.new("UICorner", toggleB).CornerRadius = UDim.new(0, 6)
+toggleB.MouseButton1Click:Connect(function()
+	counterOn = not counterOn
+	toggleB.Text = counterOn and "ON" or "OFF"
+	toggleB.BackgroundColor3 = counterOn and Color3.fromRGB(180, 40, 40) or Color3.fromRGB(35, 35, 45)
+end)
+
+task.spawn(function()
+	while true do pcall(function() countL.Text = tostring(counters) end) task.wait(0.3) end
+end)
+
+print("Auto Counter loaded! Key: 0x" .. string.format("%X", COUNTER_KEY))
