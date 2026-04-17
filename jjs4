@@ -1,0 +1,148 @@
+--[[
+JS AUTO COUNTER v11 (Knit-Integrated)
+===================
+Uses the game's internal Knit Services (Handicap & Hitbox) 
+to detect attacks before they register.
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.3) end
+if _G.__AC_CONNS then for _, c in _G.__AC_CONNS do pcall(function() c:Disconnect() end) end end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+local function track(c) if c then table.insert(_G.__AC_CONNS, c) end return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local VIM = game:GetService("VirtualInputManager")
+local Knit = require(RS:WaitForChild("Knit"):WaitForChild("Knit"))
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+track(player.CharacterAdded:Connect(function(c) char = c end))
+
+local reactOn = false
+local beforeOn = false
+local counters = 0
+local lastFire = 0
+local MAX_DIST = 18 -- Slightly higher to catch fast 'Swing' moves
+
+-- Get the Eye Catching key
+local EC_KEY = Enum.KeyCode.Three
+local function updateKey()
+    pcall(function()
+        local moveset = char:FindFirstChild("Moveset")
+        if moveset and moveset:FindFirstChild("Eye Catching") then
+            local k = moveset["Eye Catching"]:GetAttribute("Key")
+            local keys = {Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four}
+            if keys[k] then EC_KEY = keys[k] end
+        end
+    end)
+end
+updateKey()
+
+local function fireCounter()
+    if (tick() - lastFire) < 0.25 then return end
+    lastFire = tick()
+    counters = counters + 1
+
+    -- Trigger Key
+    VIM:SendKeyEvent(true, EC_KEY, false, game)
+    task.delay(0.1, function() VIM:SendKeyEvent(false, EC_KEY, false, game) end)
+
+    -- Force Fire Remote (Backdoor)
+    pcall(function()
+        local moveset = char:FindFirstChild("Moveset")
+        local ec = moveset and moveset:FindFirstChild("Eye Catching")
+        local svcName = ec and ec:GetAttribute("Service")
+        if svcName then
+            local s = RS.Knit.Knit.Services:FindFirstChild(svcName)
+            if s and s.RE and s.RE:FindFirstChild("Activated") then
+                s.RE.Activated:FireServer()
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- THE INTERCEPTORS
+-- ============================================================
+
+-- 1. Hook into HandicapService (Detects "Swing" starts)
+task.spawn(function()
+    local HandicapService = Knit.GetService("HandicapService")
+    track(HandicapService.Effects:Connect(function(p1, effectType, attacker, p4, p5)
+        if not beforeOn then return end
+        
+        -- If someone starts a "Swing" effect near us
+        if effectType == "Swing" and attacker and attacker ~= char then
+            local root = attacker:FindFirstChild("HumanoidRootPart")
+            local myRoot = char:FindFirstChild("HumanoidRootPart")
+            if root and myRoot then
+                if (root.Position - myRoot.Position).Magnitude <= MAX_DIST then
+                    fireCounter()
+                end
+            end
+        end
+    end))
+end)
+
+-- 2. Hook into HitboxService (Detects when a hitbox is actually checking for hits)
+task.spawn(function()
+    local HitboxService = Knit.GetService("HitboxService")
+    track(HitboxService.Hitbox:Connect(function(attacker, p2, p3, p4, p5)
+        if not beforeOn then return end
+        
+        -- If an attacker's hitbox is active and they are close
+        if attacker and attacker ~= char then
+            local root = attacker:FindFirstChild("HumanoidRootPart")
+            local myRoot = char:FindFirstChild("HumanoidRootPart")
+            if root and myRoot then
+                if (root.Position - myRoot.Position).Magnitude <= (MAX_DIST - 2) then
+                    fireCounter()
+                end
+            end
+        end
+    end))
+end)
+
+-- 3. Standard Health React (Panic fallback)
+track(char:WaitForChild("Humanoid").HealthChanged:Connect(function(hp)
+    if reactOn and hp < char.Humanoid.Health then
+        fireCounter()
+    end
+end))
+
+-- ============================================================
+-- MINIMAL GUI
+-- ============================================================
+local sg = Instance.new("ScreenGui", player.PlayerGui)
+sg.Name = "AutoCounterV11"
+local f = Instance.new("Frame", sg)
+f.Size = UDim2.new(0, 150, 0, 100)
+f.Position = UDim2.new(0.8, 0, 0.2, 0)
+f.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+
+local function createBtn(text, pos, callback)
+    local b = Instance.new("TextButton", f)
+    b.Size = UDim2.new(1, -10, 0, 35)
+    b.Position = pos
+    b.Text = text
+    b.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    b.TextColor3 = Color3.new(1,1,1)
+    b.MouseButton1Click:Connect(callback)
+    return b
+end
+
+local bB = createBtn("Before: OFF", UDim2.new(0, 5, 0, 10), function()
+    beforeOn = not beforeOn
+    _G.btnB.Text = "Before: " .. (beforeOn and "ON" or "OFF")
+    _G.btnB.BackgroundColor3 = beforeOn and Color3.fromRGB(100, 50, 150) or Color3.fromRGB(40, 40, 50)
+end)
+_G.btnB = bB
+
+local bR = createBtn("React: OFF", UDim2.new(0, 5, 0, 50), function()
+    reactOn = not reactOn
+    _G.btnR.Text = "React: " .. (reactOn and "ON" or "OFF")
+    _G.btnR.BackgroundColor3 = reactOn and Color3.fromRGB(150, 50, 50) or Color3.fromRGB(40, 40, 50)
+end)
+_G.btnR = bR
