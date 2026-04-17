@@ -1,0 +1,66 @@
+local printed = 0
+local function out(s)
+	print(s)
+	printed = printed + 1
+	if printed % 500 == 0 then task.wait() end
+end
+
+local function dumpTree(obj, depth, maxDepth)
+	if depth > maxDepth then return end
+	local indent = string.rep("  ", depth)
+	local info = indent .. obj.ClassName .. " | " .. obj.Name
+	pcall(function()
+		local attrs = obj:GetAttributes()
+		if next(attrs) then
+			for k, v in pairs(attrs) do
+				info = info .. " [" .. k .. "=" .. tostring(v) .. "]"
+			end
+		end
+	end)
+	out(info)
+	pcall(function()
+		for _, child in obj:GetChildren() do
+			dumpTree(child, depth + 1, maxDepth)
+		end
+	end)
+end
+
+warn("=== JS DUMP START ===")
+
+-- Remotes first (most important)
+out("========== ALL REMOTES ==========")
+pcall(function()
+	for _, obj in game.ReplicatedStorage:GetDescendants() do
+		if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") or obj:IsA("UnreliableRemoteEvent") then
+			out(obj.ClassName .. " | " .. obj:GetFullName())
+		end
+	end
+end)
+pcall(function()
+	for _, obj in workspace:GetDescendants() do
+		if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") or obj:IsA("UnreliableRemoteEvent") then
+			out(obj.ClassName .. " | " .. obj:GetFullName())
+		end
+	end
+end)
+
+-- Tree structure (no decompile = fast + no crash)
+out("\n========== REPLICATED STORAGE ==========")
+pcall(function() dumpTree(game.ReplicatedStorage, 0, 6) end)
+
+out("\n========== WORKSPACE ==========")
+pcall(function() dumpTree(workspace, 0, 3) end)
+
+out("\n========== PLAYER SCRIPTS ==========")
+pcall(function() dumpTree(game.Players.LocalPlayer.PlayerScripts, 0, 4) end)
+
+out("\n========== PLAYER GUI ==========")
+pcall(function() dumpTree(game.Players.LocalPlayer.PlayerGui, 0, 3) end)
+
+out("\n========== STARTER PLAYER ==========")
+pcall(function() dumpTree(game.StarterPlayer, 0, 4) end)
+
+out("\n========== LIGHTING ==========")
+pcall(function() dumpTree(game:GetService("Lighting"), 0, 3) end)
+
+warn("=== DONE === " .. printed .. " lines")
