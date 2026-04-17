@@ -1,0 +1,153 @@
+--[[
+    JS AUTO COUNTER v12.2 (The "Actually Functional" Edition)
+    ========================================================
+    Fixes:
+    1. Direct Service Retrieval (Skips Knit.OnStart hang)
+    2. Dynamic Signal Binding (Connects even if game is mid-match)
+    3. Debug Console Logging (Check F9 to see if signals are firing)
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.5) end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+
+local function track(c) table.insert(_G.__AC_CONNS, c) return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local VIM = game:GetService("VirtualInputManager")
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+local Knit = require(RS:WaitForChild("Knit"):WaitForChild("Knit"))
+
+-- Toggles
+local beforeOn = true
+local debugMode = true -- Check F9 to see detection logs
+local MAX_DISTANCE = 20
+
+-- Helper to find the counter key dynamically
+local function getCounterKey()
+    -- We assume '3' based on common moveset layouts, 
+    -- but you can change this to Enum.KeyCode.F or whatever your counter is.
+    return Enum.KeyCode.Three 
+end
+
+local function fireCounter()
+    if not _G.__AC_RUN then return end
+    local key = getCounterKey()
+    
+    if debugMode then print("!!! COUNTER TRIGGERED !!!") end
+    
+    VIM:SendKeyEvent(true, key, false, game)
+    task.wait(0.03)
+    VIM:SendKeyEvent(false, key, false, game)
+end
+
+-- ============================================================
+-- THE CORE LOGIC (Directly tapping the services)
+-- ============================================================
+
+local function HookServices()
+    -- Attempt to get services immediately
+    local successH, HitboxService = pcall(function() return Knit.GetService("HitboxService") end)
+    local successHandi, HandicapService = pcall(function() return Knit.GetService("HandicapService") end)
+
+    if successH and HitboxService.Hitbox then
+        if debugMode then print("Connected to HitboxService") end
+        track(HitboxService.Hitbox:Connect(function(attacker, ...)
+            if not beforeOn or attacker == char then return end
+            
+            local enemyRoot = attacker:FindFirstChild("HumanoidRootPart")
+            local myRoot = char:FindFirstChild("HumanoidRootPart")
+            
+            if enemyRoot and myRoot then
+                local dist = (enemyRoot.Position - myRoot.Position).Magnitude
+                if dist <= MAX_DISTANCE then
+                    if debugMode then print("Detection: Hitbox started by " .. attacker.Name) end
+                    fireCounter()
+                end
+            end
+        end))
+    end
+
+    if successHandi and HandicapService.Effects then
+        if debugMode then print("Connected to HandicapService") end
+        track(HandicapService.Effects:Connect(function(part, effectType, attacker, ...)
+            if not beforeOn or effectType ~= "Swing" then return end
+            
+            -- Your game's HandicapController passes the attacker model here
+            if attacker and attacker ~= char and attacker:IsA("Model") then
+                local enemyRoot = attacker:FindFirstChild("HumanoidRootPart")
+                local myRoot = char:FindFirstChild("HumanoidRootPart")
+                
+                if enemyRoot and myRoot then
+                    local dist = (enemyRoot.Position - myRoot.Position).Magnitude
+                    if dist <= MAX_DISTANCE then
+                        if debugMode then print("Detection: Swing detected from " .. attacker.Name) end
+                        fireCounter()
+                    end
+                end
+            end
+        end))
+    end
+end
+
+-- Run the hook
+task.spawn(HookServices)
+
+-- ============================================================
+-- THE GUI (Slightly improved)
+-- ============================================================
+local sg = Instance.new("ScreenGui")
+sg.Name = "AutoCounterGUI"
+sg.ResetOnSpawn = false
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 180, 0, 120)
+frame.Position = UDim2.new(0.5, -90, 0.4, 0)
+frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = sg
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 35)
+title.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Text = "KNIT COUNTER V12.2"
+title.Font = Enum.Font.Code
+title.TextSize = 16
+title.Parent = frame
+
+local function createButton(text, yPos, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -20, 0, 30)
+    btn.Position = UDim2.new(0, 10, 0, yPos)
+    btn.Text = text
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextSize = 14
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    btn.BorderSizePixel = 0
+    btn.Parent = frame
+    btn.MouseButton1Click:Connect(function() callback(btn) end)
+    return btn
+end
+
+local b1 = createButton("Auto-Counter: ON", 45, function(btn)
+    beforeOn = not beforeOn
+    btn.Text = "Auto-Counter: " .. (beforeOn and "ON" or "OFF")
+    btn.BackgroundColor3 = beforeOn and Color3.fromRGB(80, 50, 150) or Color3.fromRGB(50, 50, 60)
+end)
+b1.BackgroundColor3 = Color3.fromRGB(80, 50, 150)
+
+local b2 = createButton("Debug Logs: ON", 80, function(btn)
+    debugMode = not debugMode
+    btn.Text = "Debug Logs: " .. (debugMode and "ON" or "OFF")
+end)
+
+-- CoreGui check
+local success, _ = pcall(function() sg.Parent = game:GetService("CoreGui") end)
+if not success then sg.Parent = player:WaitForChild("PlayerGui") end
