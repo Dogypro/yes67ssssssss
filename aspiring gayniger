@@ -1,0 +1,293 @@
+--[[
+JUJUTSU SHENANIGANS — AUTO COUNTER (Charles / Eye Catching)
+============================================================
+Detects incoming attacks via:
+  1. Health drop (instant react)
+  2. Ragdoll attribute change (stun detect)
+  3. Enemy attack remotes targeting us (predictive)
+  
+Fires Eye Catching (Key 3) to counter.
+Toggle: ON/OFF + Predictive mode (reacts to incoming remotes BEFORE hit lands)
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.3) end
+if _G.__AC_CONNS then
+	for _, c in _G.__AC_CONNS do pcall(function() c:Disconnect() end) end
+end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+local CONNS = _G.__AC_CONNS
+local function track(c) if c then table.insert(CONNS, c) end return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local VIM
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+track(player.CharacterAdded:Connect(function(c) char = c setupCharWatchers() end))
+
+-- STATE
+local counterOn = false
+local predictive = false
+local counters = 0
+local lastCounter = 0
+local COOLDOWN = 1.5 -- Eye Catching cooldown estimate (seconds)
+local counterReady = true
+
+-- ============================================================
+-- FIRE EYE CATCHING
+-- ============================================================
+local function fireCounter()
+	if not counterReady then return end
+	if (tick() - lastCounter) < COOLDOWN then return end
+
+	lastCounter = tick()
+	counterReady = false
+
+	-- Method 1: Fire Knit remote directly
+	pcall(function()
+		local svc = RS.Knit.Knit.Services:FindFirstChild("EyeCatchService")
+		if svc and svc:FindFirstChild("RE") then
+			local activated = svc.RE:FindFirstChild("Activated")
+			if activated then
+				activated:FireServer()
+				counters = counters + 1
+				return
+			end
+		end
+	end)
+
+	-- Method 2: Simulate keypress (Key 3)
+	pcall(function()
+		if VIM then
+			VIM:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+			task.delay(0.05, function()
+				VIM:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
+			end)
+			counters = counters + 1
+		end
+	end)
+
+	-- Method 3: Fire via character's Cancel bindable then key
+	pcall(function()
+		local info = char:FindFirstChild("Info")
+		if info then
+			local cancel = info:FindFirstChild("Cancel")
+			if cancel then cancel:Fire() end
+		end
+	end)
+
+	task.delay(COOLDOWN, function() counterReady = true end)
+end
+
+-- ============================================================
+-- DETECTION: Health Drop
+-- ============================================================
+local function setupCharWatchers()
+	pcall(function()
+		local hum = char:WaitForChild("Humanoid", 5)
+		if not hum then return end
+
+		local lastHP = hum.Health
+		track(hum.HealthChanged:Connect(function(newHP)
+			if not counterOn then return end
+			if newHP < lastHP then
+				-- We took damage! Counter NOW
+				fireCounter()
+			end
+			lastHP = newHP
+		end))
+
+		-- Watch Ragdoll attribute (stun detection)
+		local torso = char:WaitForChild("Torso", 5)
+		if torso then
+			track(torso:GetAttributeChangedSignal("Ragdoll"):Connect(function()
+				if not counterOn then return end
+				local val = torso:GetAttribute("Ragdoll")
+				if val and val > 0 then
+					-- We got stunned/ragdolled — counter
+					fireCounter()
+				end
+			end))
+		end
+	end)
+end
+
+-- ============================================================
+-- DETECTION: Predictive (listen to ALL attack remotes)
+-- ============================================================
+local function setupPredictive()
+	pcall(function()
+		local services = RS.Knit.Knit.Services
+		for _, svc in services:GetChildren() do
+			local re = svc:FindFirstChild("RE")
+			if re then
+				-- Listen to Effects (fires when attack visuals play)
+				local effects = re:FindFirstChild("Effects")
+				if effects and effects:IsA("RemoteEvent") then
+					track(effects.OnClientEvent:Connect(function(effectName, ...)
+						if not counterOn or not predictive then return end
+						local args = {...}
+
+						-- Check if WE are the target
+						for _, arg in args do
+							if typeof(arg) == "Instance" then
+								if arg == char or (char and arg:IsDescendantOf(char)) then
+									-- Enemy ability targeting US — counter before hit lands
+									fireCounter()
+									return
+								end
+								-- Check if it's a player whose attack is aimed at us
+								if arg:IsA("Player") and arg ~= player then
+									-- Enemy activated an ability near us — predictive counter
+									local enemyChar = arg.Character
+									if enemyChar then
+										local enemyHRP = enemyChar:FindFirstChild("HumanoidRootPart")
+										local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+										if enemyHRP and myHRP then
+											local dist = (enemyHRP.Position - myHRP.Position).Magnitude
+											if dist < 25 then
+												-- Close enough to be a threat
+												fireCounter()
+												return
+											end
+										end
+									end
+								end
+							end
+						end
+					end))
+				end
+
+				-- Listen to Activated (fires when someone uses an ability)
+				local activated = re:FindFirstChild("Activated")
+				if activated and activated:IsA("RemoteEvent") then
+					track(activated.OnClientEvent:Connect(function(...)
+						if not counterOn or not predictive then return end
+						local args = {...}
+
+						for _, arg in args do
+							if typeof(arg) == "Instance" and arg:IsA("Player") and arg ~= player then
+								local enemyChar = arg.Character
+								if enemyChar then
+									local enemyHRP = enemyChar:FindFirstChild("HumanoidRootPart")
+									local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+									if enemyHRP and myHRP then
+										local dist = (enemyHRP.Position - myHRP.Position).Magnitude
+										if dist < 20 then
+											fireCounter()
+											return
+										end
+									end
+								end
+							end
+						end
+					end))
+				end
+
+				-- Listen to Hitbox events (direct hit confirmation)
+				local hitbox = re:FindFirstChild("Hitbox")
+				if hitbox and hitbox:IsA("RemoteEvent") then
+					track(hitbox.OnClientEvent:Connect(function(...)
+						if not counterOn then return end
+						local args = {...}
+						for _, arg in args do
+							if typeof(arg) == "Instance" then
+								if arg == char or (char and arg:IsDescendantOf(char)) then
+									fireCounter()
+									return
+								end
+							end
+						end
+					end))
+				end
+			end
+		end
+	end)
+end
+
+-- Init watchers
+setupCharWatchers()
+setupPredictive()
+
+-- ============================================================
+-- GUI
+-- ============================================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("AC1"):Destroy() end)
+pcall(function() player.PlayerGui:FindFirstChild("AC1"):Destroy() end)
+local guiParent
+local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC1" g.Parent=game:GetService("CoreGui") guiParent=g end)
+if not ok1 then
+	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC1" g.Parent=gethui() guiParent=g end)
+	if not ok2 then local g = Instance.new("ScreenGui") g.Name="AC1" g.ResetOnSpawn=false g.Parent=player.PlayerGui guiParent=g end
+end
+guiParent.ResetOnSpawn = false
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 180, 0, 130)
+fr.Position = UDim2.new(1, -190, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+fr.BorderSizePixel = 0
+fr.Active = true
+fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+local stk = Instance.new("UIStroke") stk.Color=Color3.fromRGB(60,40,80) stk.Thickness=1.5 stk.Parent=fr
+
+-- Drag
+local dragging, dragStart, startPos
+track(fr.InputBegan:Connect(function(input)
+	if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+		dragging=true dragStart=input.Position startPos=fr.Position
+		input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end)
+	end
+end))
+track(UIS.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then
+		local d=input.Position-dragStart fr.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
+	end
+end))
+
+local yy = 5
+local function lbl(t, c, s)
+	local l = Instance.new("TextLabel") l.Size=UDim2.new(1,-12,0,13) l.Position=UDim2.new(0,6,0,yy)
+	l.BackgroundTransparency=1 l.Text=t l.TextColor3=c or Color3.fromRGB(180,180,190) l.TextSize=s or 11
+	l.Font=Enum.Font.GothamBold l.TextXAlignment=Enum.TextXAlignment.Left l.Parent=fr yy=yy+15 return l
+end
+local function btn(t, c)
+	local b = Instance.new("TextButton") b.Size=UDim2.new(1,-12,0,22) b.Position=UDim2.new(0,6,0,yy)
+	b.BackgroundColor3=c b.Text=t b.TextColor3=Color3.new(1,1,1) b.TextSize=11 b.Font=Enum.Font.GothamBold
+	b.Parent=fr Instance.new("UICorner",b).CornerRadius=UDim.new(0,5) yy=yy+25 return b
+end
+
+lbl("EYE CATCHING", Color3.fromRGB(255, 180, 50), 13)
+local statL = lbl("Ready | Counters: 0", Color3.fromRGB(100,220,100), 10)
+
+local toggleB = btn("Counter: OFF", Color3.fromRGB(50,50,60))
+toggleB.MouseButton1Click:Connect(function()
+	counterOn = not counterOn
+	toggleB.Text = "Counter: " .. (counterOn and "ON" or "OFF")
+	toggleB.BackgroundColor3 = counterOn and Color3.fromRGB(220,60,60) or Color3.fromRGB(50,50,60)
+end)
+
+local predB = btn("Predict: OFF", Color3.fromRGB(50,50,60))
+predB.MouseButton1Click:Connect(function()
+	predictive = not predictive
+	predB.Text = "Predict: " .. (predictive and "ON" or "OFF")
+	predB.BackgroundColor3 = predictive and Color3.fromRGB(140,80,220) or Color3.fromRGB(50,50,60)
+end)
+
+-- Status update
+task.spawn(function()
+	while _G.__AC_RUN do
+		pcall(function()
+			local cd = math.max(0, COOLDOWN - (tick() - lastCounter))
+			local ready = cd < 0.1
+			statL.Text = (ready and "Ready" or string.format("CD: %.1fs", cd)) .. " | Counters: " .. counters
+			statL.TextColor3 = ready and Color3.fromRGB(100,220,100) or Color3.fromRGB(220,100,100)
+		end)
+		task.wait(0.1)
+	end
+end)
