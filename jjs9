@@ -1,0 +1,316 @@
+--[[
+JS AUTO COUNTER v10
+====================
+Counters RIGHT BEFORE an attack hits you.
+
+MELEE: Tracks every enemy each frame.
+  - Are they in a combat animation? (not walk/idle/jump/fall)
+  - Are they getting CLOSER to me? (distance shrinking)
+  - Are they about to reach me? (< 5 studs)
+  All 3 = attack about to connect → counter.
+
+  If enemy is fighting someone else nearby, they're NOT approaching
+  you, so no false trigger.
+
+PROJECTILE: Tracks parts spawning in workspace.Effects.
+  - Is it moving toward me?
+  - Will it reach me within 0.15 seconds?
+  Both = counter.
+
+REMOTE BACKUP: Game says you're the target → counter.
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.3) end
+if _G.__AC_CONNS then for _, c in _G.__AC_CONNS do pcall(function() c:Disconnect() end) end end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+local function track(c) if c then table.insert(_G.__AC_CONNS, c) end return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RUN = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local VIM pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+track(player.CharacterAdded:Connect(function(c) char = c task.wait(0.3) watchAllEnemies() end))
+
+local counterOn = false
+local counters = 0
+local lastFire = 0
+
+-- Non-combat animation IDs (from Animate script — same for all characters)
+local SAFE = {}
+for _, id in {"180435571","180435792","15621270146","7012721719","180436334","9442520397","178130996"} do
+	SAFE[id] = true
+end
+
+-- Eye Catching key
+local EC_KEY = Enum.KeyCode.Three
+pcall(function()
+	local ec = char:FindFirstChild("Moveset") and char.Moveset:FindFirstChild("Eye Catching")
+	if ec then
+		local k = ec:GetAttribute("Key")
+		if k == 1 then EC_KEY = Enum.KeyCode.One
+		elseif k == 2 then EC_KEY = Enum.KeyCode.Two
+		elseif k == 4 then EC_KEY = Enum.KeyCode.Four end
+	end
+end)
+
+-- ============================================================
+-- FIRE EYE CATCHING
+-- ============================================================
+local function fire()
+	if not counterOn then return end
+	if (tick() - lastFire) < 0.2 then return end
+	lastFire = tick()
+	counters = counters + 1
+
+	if VIM then
+		pcall(function() VIM:SendKeyEvent(true, EC_KEY, false, game) end)
+		task.delay(0.15, function()
+			pcall(function() VIM:SendKeyEvent(false, EC_KEY, false, game) end)
+		end)
+	end
+
+	pcall(function()
+		local svcName = char and char:FindFirstChild("Moveset") and char.Moveset:FindFirstChild("Eye Catching") and char.Moveset["Eye Catching"]:GetAttribute("Service")
+		if svcName then
+			local svc = RS.Knit.Knit.Services:FindFirstChild(svcName)
+			if svc and svc.RE and svc.RE:FindFirstChild("Activated") then
+				svc.RE.Activated:FireServer()
+			end
+		end
+	end)
+end
+
+-- ============================================================
+-- MELEE DETECTION: Track enemies every frame
+-- ============================================================
+local enemyData = {} -- [player] = { dist, inCombat, approaching }
+
+local function isInCombatAnim(p)
+	local c = p.Character
+	if not c then return false end
+	local hum = c:FindFirstChildOfClass("Humanoid")
+	if not hum then return false end
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then return false end
+
+	for _, t in animator:GetPlayingAnimationTracks() do
+		if t.IsPlaying and t.Animation then
+			local id = t.Animation.AnimationId
+			if id then
+				local numId = id:match("%d+")
+				if numId and not SAFE[numId] then
+					return true -- playing a non-safe animation = combat
+				end
+			end
+		end
+	end
+	return false
+end
+
+local watching = {}
+
+function watchAllEnemies()
+	for _, p in Players:GetPlayers() do
+		if p ~= player and not watching[p] then
+			watching[p] = true
+		end
+	end
+end
+watchAllEnemies()
+track(Players.PlayerAdded:Connect(function(p) watching[p] = true end))
+track(Players.PlayerRemoving:Connect(function(p) watching[p] = nil enemyData[p] = nil end))
+
+-- Main loop: check every frame
+track(RUN.Heartbeat:Connect(function()
+	if not counterOn then return end
+
+	local myHrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not myHrp then return end
+	local myPos = myHrp.Position
+
+	for p, _ in watching do
+		if p == player then continue end
+		local c = p.Character
+		if not c then continue end
+		local eHrp = c:FindFirstChild("HumanoidRootPart")
+		if not eHrp then continue end
+
+		local dist = (eHrp.Position - myPos).Magnitude
+		local combat = isInCombatAnim(p)
+		local prev = enemyData[p]
+
+		if combat and prev and prev.combat then
+			-- They were attacking last frame AND still attacking
+			local approaching = dist < (prev.dist - 0.05) -- getting closer
+			local close = dist < 5 -- about to hit range
+
+			if approaching and close then
+				-- Attack is about to connect → COUNTER
+				fire()
+			end
+
+			-- Also catch: they're already on top of us and attacking
+			if dist < 3 and combat then
+				fire()
+			end
+		end
+
+		enemyData[p] = { dist = dist, combat = combat }
+	end
+end))
+
+-- ============================================================
+-- PROJECTILE DETECTION: Track parts in workspace.Effects
+-- ============================================================
+pcall(function()
+	local eff = workspace:FindFirstChild("Effects")
+	if not eff then return end
+
+	track(eff.ChildAdded:Connect(function(part)
+		if not counterOn then return end
+		if not part:IsA("BasePart") then return end
+
+		-- Track this part for a short time
+		local frames = 0
+		local conn
+		conn = RUN.Heartbeat:Connect(function()
+			frames = frames + 1
+			if frames > 60 or not part.Parent then -- track for max 1 second
+				conn:Disconnect()
+				return
+			end
+
+			pcall(function()
+				local myHrp = char and char:FindFirstChild("HumanoidRootPart")
+				if not myHrp then return end
+
+				local dist = (part.Position - myHrp.Position).Magnitude
+				if dist > 20 then return end -- too far to care
+
+				local vel = part.AssemblyLinearVelocity
+				local speed = vel.Magnitude
+
+				if speed > 5 then
+					-- Moving projectile — check if aimed at me
+					local toMe = (myHrp.Position - part.Position).Unit
+					local aimed = vel.Unit:Dot(toMe)
+
+					if aimed > 0.5 then
+						-- Headed toward me — how soon will it arrive?
+						local timeToHit = dist / speed
+
+						if timeToHit < 0.2 and dist < 10 then
+							-- About to hit me → counter
+							fire()
+							conn:Disconnect()
+						end
+					end
+				elseif dist < 4 then
+					-- Stationary effect appeared right on top of me (AoE)
+					fire()
+					conn:Disconnect()
+				end
+			end)
+		end)
+		track(conn)
+	end))
+end)
+
+-- ============================================================
+-- REMOTE BACKUP: Our character confirmed as target
+-- ============================================================
+pcall(function()
+	for _, svc in RS.Knit.Knit.Services:GetChildren() do
+		local re = svc:FindFirstChild("RE")
+		if not re or svc.Name == "EyeCatchService" then continue end
+
+		for _, remote in re:GetChildren() do
+			if not remote:IsA("RemoteEvent") then continue end
+			track(remote.OnClientEvent:Connect(function(...)
+				if not counterOn then return end
+				for _, arg in {...} do
+					if typeof(arg) == "Instance" and arg == char then
+						fire()
+						return
+					end
+				end
+			end))
+		end
+	end
+end)
+
+-- ============================================================
+-- GUI
+-- ============================================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("AC10"):Destroy() end)
+pcall(function() player.PlayerGui:FindFirstChild("AC10"):Destroy() end)
+local guiParent
+local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC10" g.Parent=game:GetService("CoreGui") guiParent=g end)
+if not ok1 then
+	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC10" g.Parent=gethui() guiParent=g end)
+	if not ok2 then local g = Instance.new("ScreenGui") g.Name="AC10" g.ResetOnSpawn=false g.Parent=player.PlayerGui guiParent=g end
+end
+guiParent.ResetOnSpawn = false
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 150, 0, 85)
+fr.Position = UDim2.new(1, -160, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", fr).Color = Color3.fromRGB(80, 50, 100)
+
+local dragging, dragStart, startPos
+track(fr.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		dragging = true dragStart = i.Position startPos = fr.Position
+		i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+	end
+end))
+track(UIS.InputChanged:Connect(function(i)
+	if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		local d = i.Position - dragStart
+		fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end))
+
+local titleL = Instance.new("TextLabel")
+titleL.Size = UDim2.new(0.6, 0, 0, 12) titleL.Position = UDim2.new(0, 8, 0, 6)
+titleL.BackgroundTransparency = 1 titleL.Text = "AUTO COUNTER" titleL.TextColor3 = Color3.fromRGB(255, 180, 50)
+titleL.TextSize = 10 titleL.Font = Enum.Font.GothamBold titleL.TextXAlignment = Enum.TextXAlignment.Left titleL.Parent = fr
+
+local countL = Instance.new("TextLabel")
+countL.Size = UDim2.new(0.4, -8, 0, 12) countL.Position = UDim2.new(0.6, 0, 0, 6)
+countL.BackgroundTransparency = 1 countL.Text = "0" countL.TextColor3 = Color3.fromRGB(140, 140, 150)
+countL.TextSize = 10 countL.Font = Enum.Font.Gotham countL.TextXAlignment = Enum.TextXAlignment.Right countL.Parent = fr
+
+local testB = Instance.new("TextButton")
+testB.Size = UDim2.new(1, -14, 0, 20) testB.Position = UDim2.new(0, 7, 0, 22)
+testB.BackgroundColor3 = Color3.fromRGB(50, 120, 50) testB.Text = "TEST"
+testB.TextColor3 = Color3.new(1, 1, 1) testB.TextSize = 10 testB.Font = Enum.Font.GothamBold
+testB.Parent = fr Instance.new("UICorner", testB).CornerRadius = UDim.new(0, 5)
+testB.MouseButton1Click:Connect(function()
+	lastFire = 0 fire()
+	testB.Text = "Fired!" task.delay(0.5, function() testB.Text = "TEST" end)
+end)
+
+local toggleB = Instance.new("TextButton")
+toggleB.Size = UDim2.new(1, -14, 0, 24) toggleB.Position = UDim2.new(0, 7, 0, 46)
+toggleB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) toggleB.Text = "OFF"
+toggleB.TextColor3 = Color3.fromRGB(200, 200, 210) toggleB.TextSize = 13 toggleB.Font = Enum.Font.GothamBold
+toggleB.Parent = fr Instance.new("UICorner", toggleB).CornerRadius = UDim.new(0, 6)
+toggleB.MouseButton1Click:Connect(function()
+	counterOn = not counterOn
+	toggleB.Text = counterOn and "ON" or "OFF"
+	toggleB.BackgroundColor3 = counterOn and Color3.fromRGB(180, 40, 40) or Color3.fromRGB(35, 35, 45)
+	toggleB.TextColor3 = counterOn and Color3.new(1, 1, 1) or Color3.fromRGB(200, 200, 210)
+end)
+
+task.spawn(function()
+	while _G.__AC_RUN do pcall(function() countL.Text = tostring(counters) end) task.wait(0.3) end
+end)
