@@ -1,0 +1,70 @@
+-- Find EyeCatch remote + how abilities fire
+local printed = 0
+local function out(s) print(s) printed = printed + 1 if printed % 200 == 0 then task.wait() end end
+
+-- Find ALL EyeCatch related
+out("=== EYECATCH REMOTES ===")
+for _, obj in game.ReplicatedStorage:GetDescendants() do
+	if obj.Name:lower():find("eye") or obj.Name:lower():find("catch") or obj:GetFullName():lower():find("eye") then
+		out(obj.ClassName .. " | " .. obj:GetFullName())
+	end
+end
+
+-- Find how Knit services activate (check for any "Activate" pattern)
+out("=== ALL ACTIVATED REMOTES ===")
+for _, obj in game.ReplicatedStorage:GetDescendants() do
+	if obj:IsA("RemoteEvent") and obj.Name == "Activated" then
+		out(obj:GetFullName())
+	end
+end
+
+-- Decompile KnitRunClient (how client fires abilities)
+out("=== KNIT RUN CLIENT ===")
+pcall(function()
+	local src = decompile(game.StarterPlayer.StarterPlayerScripts.KnitRunClient)
+	if src then for line in src:gmatch("[^\n]*") do out(line) end end
+end)
+
+-- Decompile Charles folder scripts
+out("=== CHARLES SCRIPTS ===")
+pcall(function()
+	local charles = game.StarterPlayer.StarterPlayerScripts.Controllers.Moveset.Charles
+	for _, obj in charles:GetDescendants() do
+		if obj:IsA("ModuleScript") then
+			out("--- " .. obj:GetFullName() .. " ---")
+			pcall(function()
+				local src = decompile(obj)
+				if src then for line in src:gmatch("[^\n]*") do out(line) end
+				else out("FAILED TO DECOMPILE") end
+			end)
+		end
+	end
+end)
+
+-- Check how hit detection works on character
+out("=== CHARACTER HIT ATTRIBUTES ===")
+local char = game.Players.LocalPlayer.Character
+for _, obj in char:GetDescendants() do
+	local attrs = {}
+	pcall(function() attrs = obj:GetAttributes() end)
+	if next(attrs) then
+		local s = obj.ClassName .. " | " .. obj.Name
+		for k, v in pairs(attrs) do s = s .. " [" .. k .. "=" .. tostring(v) .. "]" end
+		out(s)
+	end
+end
+
+-- Check Humanoid states
+out("=== HUMANOID STATUS ===")
+pcall(function()
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	out("Health: " .. hum.Health .. "/" .. hum.MaxHealth)
+	local status = char:FindFirstChild("Status")
+	if status then
+		for _, v in status:GetChildren() do
+			out("Status: " .. v.ClassName .. " | " .. v.Name .. " = " .. tostring(v.Value))
+		end
+	end
+end)
+
+warn("DONE: " .. printed)
