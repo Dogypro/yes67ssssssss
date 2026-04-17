@@ -1,0 +1,100 @@
+_G.__SD_RUN = true
+local cur = {}
+local function out(s) print(s) table.insert(cur, tostring(s)) end
+
+local function slowDecompile(obj)
+	out("--- DECOMPILING: " .. obj:GetFullName() .. " ---")
+	local ok, src = pcall(decompile, obj)
+	if not ok or not src or #src < 10 then
+		out("FAILED/OBFUSCATED")
+		return
+	end
+	out("=== SOURCE: " .. obj:GetFullName() .. " ===")
+	for line in src:gmatch("[^\n]*") do out(line) end
+	out("=== END ===")
+	task.wait(3 + math.random() * 2)
+end
+
+warn("[SD] Starting...")
+
+-- Use LIVE player scripts, not StarterPlayer
+local PS = game.Players.LocalPlayer:FindFirstChild("PlayerScripts")
+if not PS then
+	PS = game.Players.LocalPlayer:WaitForChild("PlayerScripts", 5)
+end
+
+if not PS then
+	warn("[SD] No PlayerScripts found!")
+else
+	warn("[SD] Found PlayerScripts")
+	
+	-- Find controllers
+	local ctrl = PS:FindFirstChild("Controllers")
+	if ctrl then
+		warn("[SD] Found Controllers")
+		
+		-- Combat
+		pcall(function()
+			for _, obj in ctrl.Combat:GetDescendants() do
+				if obj:IsA("ModuleScript") and _G.__SD_RUN then slowDecompile(obj) end
+			end
+		end)
+		
+		-- Charles moveset
+		pcall(function()
+			for _, obj in ctrl.Moveset.Charles:GetDescendants() do
+				if obj:IsA("ModuleScript") and _G.__SD_RUN then slowDecompile(obj) end
+			end
+		end)
+		
+		-- Movement
+		pcall(function()
+			if ctrl.Character:FindFirstChild("MovementController") then
+				slowDecompile(ctrl.Character.MovementController)
+			end
+		end)
+		
+		-- FX
+		pcall(function()
+			if ctrl:FindFirstChild("FXController") then
+				slowDecompile(ctrl.FXController)
+			end
+		end)
+	else
+		warn("[SD] No Controllers — scanning all ModuleScripts in PlayerScripts")
+		pcall(function()
+			for _, obj in PS:GetDescendants() do
+				if obj:IsA("ModuleScript") and _G.__SD_RUN then
+					local name = obj.Name:lower()
+					if name:find("combat") or name:find("hit") or name:find("move")
+						or name:find("charles") or name:find("eye") or name:find("fx")
+						or name:find("block") or name:find("tool") then
+						slowDecompile(obj)
+					end
+				end
+			end
+		end)
+	end
+end
+
+-- Knit EyeCatch service
+pcall(function()
+	local services = game.ReplicatedStorage.Knit.Knit.Services
+	for _, svc in services:GetChildren() do
+		if not _G.__SD_RUN then break end
+		local name = svc.Name:lower()
+		if name:find("eye") or name:find("catch") or name:find("combat")
+			or name:find("melee") or name:find("block") or name:find("guard") then
+			warn("[SD] Found service: " .. svc.Name)
+			for _, obj in svc:GetDescendants() do
+				if obj:IsA("ModuleScript") and _G.__SD_RUN then slowDecompile(obj) end
+			end
+		end
+	end
+end)
+
+-- Save
+local full = table.concat(cur, "\n")
+pcall(function() writefile("js_combat.txt", full) warn("[SD] SAVED js_combat.txt") end)
+pcall(function() setclipboard(full) warn("[SD] COPIED clipboard") end)
+warn("[SD] DONE — " .. #cur .. " lines")
