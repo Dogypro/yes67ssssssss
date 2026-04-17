@@ -1,0 +1,113 @@
+--[[
+    JS AUTO COUNTER v12 (Knit-Service Hook)
+    ========================================
+    Targeting specific Knit signals found in user scripts:
+    1. HitboxService.Hitbox -> The "Golden Signal" (Attack start)
+    2. HandicapService.Effects -> The "Swing" signal (Movement start)
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.5) end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+
+local function track(c) table.insert(_G.__AC_CONNS, c) return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local VIM = game:GetService("VirtualInputManager")
+
+-- Knit Retrieval
+local Knit = require(RS:WaitForChild("Knit"):WaitForChild("Knit"))
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+
+-- Configuration
+local beforeOn = true -- Default to ON since you want that 100% counter
+local MAX_DISTANCE = 18 -- Reach for the hitbox check
+
+-- Get the current "Eye Catching" Key
+local function getCounterKey()
+    local key = Enum.KeyCode.Three -- Fallback
+    pcall(function()
+        local moveset = char:FindFirstChild("Moveset")
+        local ec = moveset and moveset:FindFirstChild("Eye Catching")
+        if ec then
+            local k = ec:GetAttribute("Key")
+            local map = {Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four}
+            key = map[k] or key
+        end
+    end)
+    return key
+end
+
+local function fireCounter()
+    if not _G.__AC_RUN then return end
+    local key = getCounterKey()
+    
+    -- Press the key physically
+    VIM:SendKeyEvent(true, key, false, game)
+    task.wait(0.05)
+    VIM:SendKeyEvent(false, key, false, game)
+    
+    -- Force fire the Knit service as a backup
+    pcall(function()
+        local ec = char.Moveset:FindFirstChild("Eye Catching")
+        local svcName = ec:GetAttribute("Service")
+        local svc = RS.Knit.Knit.Services:FindFirstChild(svcName)
+        if svc and svc.RE:FindFirstChild("Activated") then
+            svc.RE.Activated:FireServer()
+        end
+    end)
+end
+
+-- ============================================================
+-- THE INTERCEPTION LOGIC (Based on your provided scripts)
+-- ============================================================
+
+Knit.OnStart():andThen(function()
+    local HitboxService = Knit.GetService("HitboxService")
+    local HandicapService = Knit.GetService("HandicapService")
+
+    -- 1. Hitbox Signal: Triggers when the server tells a client to open a hitbox
+    track(HitboxService.Hitbox:Connect(function(attacker, p20, p21, p22, p23)
+        if not beforeOn or attacker == char then return end
+        
+        local enemyRoot = attacker:FindFirstChild("HumanoidRootPart")
+        local myRoot = char:FindFirstChild("HumanoidRootPart")
+        
+        if enemyRoot and myRoot then
+            local dist = (enemyRoot.Position - myRoot.Position).Magnitude
+            if dist <= MAX_DISTANCE then
+                fireCounter()
+            end
+        end
+    end))
+
+    -- 2. Effects Signal: Triggers when a "Swing" or "Collide" starts
+    track(HandicapService.Effects:Connect(function(part, effectType, attacker, p4, p5)
+        if not beforeOn or effectType ~= "Swing" then return end
+        
+        -- In your HandicapController, 'attacker' is passed during a Swing
+        if attacker and attacker ~= char and attacker:IsA("Model") then
+            local enemyRoot = attacker:FindFirstChild("HumanoidRootPart")
+            local myRoot = char:FindFirstChild("HumanoidRootPart")
+            
+            if enemyRoot and myRoot then
+                local dist = (enemyRoot.Position - myRoot.Position).Magnitude
+                if dist <= MAX_DISTANCE then
+                    fireCounter()
+                end
+            end
+        end
+    end))
+end)
+
+-- Health Fallback (Panic Mode)
+track(char:WaitForChild("Humanoid").HealthChanged:Connect(function(hp)
+    -- If health drops suddenly, just in case the hitbox detection was too slow
+    if hp < char.Humanoid.Health then
+        fireCounter()
+    end
+end))
+
+print("v12 Hooked to HitboxService & HandicapService!")
