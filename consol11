@@ -1,0 +1,133 @@
+-- COMBAT ANALYZER: Have someone attack you while this runs
+-- It watches EVERYTHING that happens when you get hit
+
+local player = game.Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+local RS = game.ReplicatedStorage
+
+local LOG = {}
+local function log(s) table.insert(LOG, string.format("[%.3f] %s", tick() % 1000, s)) print("[CA]", s) end
+
+log("=== COMBAT ANALYZER STARTED ===")
+log("=== Have someone attack you! ===")
+
+-- 1. Watch ALL remotes firing with full args
+pcall(function()
+	for _, svc in RS.Knit.Knit.Services:GetChildren() do
+		local re = svc:FindFirstChild("RE")
+		if not re then continue end
+		for _, remote in re:GetChildren() do
+			if remote:IsA("RemoteEvent") then
+				remote.OnClientEvent:Connect(function(...)
+					local args = {...}
+					local argStr = ""
+					for i, a in args do
+						if typeof(a) == "Instance" then
+							argStr = argStr .. i .. "=" .. a.ClassName .. ":" .. a.Name .. " "
+						elseif typeof(a) == "string" then
+							argStr = argStr .. i .. "=\"" .. a .. "\" "
+						elseif typeof(a) == "number" then
+							argStr = argStr .. i .. "=" .. tostring(a) .. " "
+						elseif typeof(a) == "Vector3" then
+							argStr = argStr .. i .. "=Vec3 "
+						elseif typeof(a) == "CFrame" then
+							argStr = argStr .. i .. "=CFrame "
+						elseif typeof(a) == "boolean" then
+							argStr = argStr .. i .. "=" .. tostring(a) .. " "
+						else
+							argStr = argStr .. i .. "=" .. typeof(a) .. " "
+						end
+					end
+					log("REMOTE: " .. svc.Name .. "." .. remote.Name .. " | " .. argStr)
+				end)
+			end
+		end
+	end
+end)
+
+-- 2. Watch workspace.Effects for new hitbox/projectile parts
+pcall(function()
+	local eff = workspace:FindFirstChild("Effects")
+	if eff then
+		eff.DescendantAdded:Connect(function(obj)
+			if obj:IsA("BasePart") then
+				log("EFFECT SPAWNED: " .. obj.Name .. " pos=" .. tostring(obj.Position) .. " size=" .. tostring(obj.Size))
+			end
+		end)
+	end
+end)
+
+-- 3. Watch for ANY new part near us (hitbox detection)
+workspace.DescendantAdded:Connect(function(obj)
+	if not obj:IsA("BasePart") then return end
+	pcall(function()
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		if hrp and (obj.Position - hrp.Position).Magnitude < 30 then
+			if obj.Name ~= "Collide" and obj.Transparency >= 0.5 then -- likely a hitbox
+				log("NEARBY PART: " .. obj.Name .. " parent=" .. (obj.Parent and obj.Parent.Name or "nil") .. " dist=" .. math.floor((obj.Position - hrp.Position).Magnitude) .. " transp=" .. obj.Transparency .. " size=" .. tostring(obj.Size))
+			end
+		end
+	end)
+end)
+
+-- 4. Watch enemy animations
+for _, p in game.Players:GetPlayers() do
+	if p ~= player and p.Character then
+		pcall(function()
+			local hum = p.Character:FindFirstChildOfClass("Humanoid")
+			if hum then
+				local animator = hum:FindFirstChildOfClass("Animator")
+				if animator then
+					animator.AnimationPlayed:Connect(function(track)
+						local hrp = char:FindFirstChild("HumanoidRootPart")
+						local eHrp = p.Character:FindFirstChild("HumanoidRootPart")
+						if hrp and eHrp then
+							local dist = math.floor((eHrp.Position - hrp.Position).Magnitude)
+							if dist < 40 then
+								log("ENEMY ANIM: " .. p.Name .. " playing \"" .. track.Name .. "\" id=" .. tostring(track.Animation and track.Animation.AnimationId or "?") .. " dist=" .. dist)
+							end
+						end
+					end)
+				end
+			end
+		end)
+	end
+end
+
+-- 5. Watch health changes
+pcall(function()
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local lastHP = hum.Health
+	hum.HealthChanged:Connect(function(hp)
+		if hp < lastHP then
+			log("DAMAGE TAKEN: " .. math.floor(lastHP - hp) .. " dmg (was " .. math.floor(lastHP) .. " now " .. math.floor(hp) .. ")")
+		end
+		lastHP = hp
+	end)
+end)
+
+-- 6. Watch character attributes changing (stun, ragdoll etc)
+for _, part in char:GetDescendants() do
+	pcall(function()
+		if part:IsA("BasePart") then
+			part:GetAttributeChangedSignal("Ragdoll"):Connect(function()
+				log("RAGDOLL CHANGED: " .. part.Name .. " = " .. tostring(part:GetAttribute("Ragdoll")))
+			end)
+		end
+	end)
+end
+
+-- 7. Watch Status folder
+pcall(function()
+	local status = char:FindFirstChild("Humanoid") and char.Humanoid:FindFirstChild("Status")
+	if status then
+		status.ChildAdded:Connect(function(c) log("STATUS ADDED: " .. c.ClassName .. " " .. c.Name) end)
+		status.ChildRemoved:Connect(function(c) log("STATUS REMOVED: " .. c.ClassName .. " " .. c.Name) end)
+	end
+end)
+
+-- Print summary after 30s
+task.delay(30, function()
+	warn("=== SUMMARY: " .. #LOG .. " events captured ===")
+	warn("=== Copy console output and send to me ===")
+end)
