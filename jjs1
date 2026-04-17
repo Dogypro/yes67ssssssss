@@ -1,0 +1,205 @@
+--[[
+JS AUTO COUNTER v7 — Eye Catching
+===================================
+Two modes:
+
+REACT: Counters the EXACT tick you take damage.
+  Health drops → counter fires same tick.
+  Works for M1s, abilities, dashes, grabs, EVERYTHING.
+  No false positives — only fires when you actually get hit.
+  First hit lands, counter activates, next hit gets countered.
+
+BEFORE: Counters when the game confirms you're a target.
+  Only fires when YOUR character appears in a hit event.
+  No facing checks. No distance guessing. No predictions.
+  
+Both can be on at the same time for max coverage.
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.3) end
+if _G.__AC_CONNS then for _, c in _G.__AC_CONNS do pcall(function() c:Disconnect() end) end end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+local function track(c) if c then table.insert(_G.__AC_CONNS, c) end return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local VIM pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+track(player.CharacterAdded:Connect(function(c) char = c connectHealth() end))
+
+local reactOn = false
+local beforeOn = false
+local counters = 0
+local lastFire = 0
+
+-- ============================================================
+-- FIRE EYE CATCHING — zero delay
+-- ============================================================
+local function fireCounter()
+	if (tick() - lastFire) < 0.25 then return end
+	lastFire = tick()
+
+	-- Cancel current action
+	pcall(function()
+		local info = char and char:FindFirstChild("Info")
+		if info then local c = info:FindFirstChild("Cancel") if c then c:Fire() end end
+	end)
+
+	-- Press key 3 immediately
+	pcall(function()
+		if VIM then
+			VIM:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+			task.delay(0.07, function()
+				pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.Three, false, game) end)
+			end)
+		end
+	end)
+
+	counters = counters + 1
+end
+
+-- ============================================================
+-- REACT MODE: Counter on health drop (same tick)
+-- Zero prediction. Zero false positives.
+-- ============================================================
+function connectHealth()
+	pcall(function()
+		local hum = char and char:WaitForChild("Humanoid", 5)
+		if not hum then return end
+		local lastHP = hum.Health
+		track(hum.HealthChanged:Connect(function(hp)
+			if not reactOn then lastHP = hp return end
+			if hp < lastHP then
+				-- We took damage THIS tick — counter NOW
+				fireCounter()
+			end
+			lastHP = hp
+		end))
+	end)
+end
+connectHealth()
+
+-- ============================================================
+-- BEFORE MODE: Counter when our character is in hit args
+-- No distance check. No facing check. No keyword filter.
+-- ONLY fires when the game explicitly references our character.
+-- ============================================================
+pcall(function()
+	for _, svc in RS.Knit.Knit.Services:GetChildren() do
+		local re = svc:FindFirstChild("RE")
+		if not re then continue end
+		if svc.Name == "EyeCatchService" then continue end
+
+		for _, remote in re:GetChildren() do
+			if not remote:IsA("RemoteEvent") then continue end
+
+			track(remote.OnClientEvent:Connect(function(...)
+				if not beforeOn then return end
+				local args = {...}
+
+				-- Check every single argument
+				for _, arg in args do
+					if typeof(arg) == "Instance" then
+						-- Our character model
+						if arg == char then
+							fireCounter()
+							return
+						end
+						-- Our player instance
+						if arg == player then
+							fireCounter()
+							return
+						end
+						-- A part inside our character (HRP, Torso, etc)
+						if char and arg:IsDescendantOf(char) then
+							fireCounter()
+							return
+						end
+					end
+				end
+			end))
+		end
+	end
+end)
+
+-- ============================================================
+-- GUI
+-- ============================================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("AC7"):Destroy() end)
+pcall(function() player.PlayerGui:FindFirstChild("AC7"):Destroy() end)
+local guiParent
+local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC7" g.Parent=game:GetService("CoreGui") guiParent=g end)
+if not ok1 then
+	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC7" g.Parent=gethui() guiParent=g end)
+	if not ok2 then local g = Instance.new("ScreenGui") g.Name="AC7" g.ResetOnSpawn=false g.Parent=player.PlayerGui guiParent=g end
+end
+guiParent.ResetOnSpawn = false
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 155, 0, 100)
+fr.Position = UDim2.new(1, -165, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", fr).Color = Color3.fromRGB(80, 50, 100)
+
+-- Drag
+local dragging, dragStart, startPos
+track(fr.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		dragging = true dragStart = i.Position startPos = fr.Position
+		i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+	end
+end))
+track(UIS.InputChanged:Connect(function(i)
+	if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		local d = i.Position - dragStart
+		fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end))
+
+-- Title + counter
+local titleL = Instance.new("TextLabel")
+titleL.Size = UDim2.new(0.55, 0, 0, 12) titleL.Position = UDim2.new(0, 8, 0, 5)
+titleL.BackgroundTransparency = 1 titleL.Text = "COUNTER" titleL.TextColor3 = Color3.fromRGB(255, 180, 50)
+titleL.TextSize = 11 titleL.Font = Enum.Font.GothamBold titleL.TextXAlignment = Enum.TextXAlignment.Left titleL.Parent = fr
+
+local countL = Instance.new("TextLabel")
+countL.Size = UDim2.new(0.45, -8, 0, 12) countL.Position = UDim2.new(0.55, 0, 0, 5)
+countL.BackgroundTransparency = 1 countL.Text = "0" countL.TextColor3 = Color3.fromRGB(140, 140, 150)
+countL.TextSize = 10 countL.Font = Enum.Font.Gotham countL.TextXAlignment = Enum.TextXAlignment.Right countL.Parent = fr
+
+-- React button
+local reactB = Instance.new("TextButton")
+reactB.Size = UDim2.new(1, -14, 0, 24) reactB.Position = UDim2.new(0, 7, 0, 22)
+reactB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) reactB.Text = "React: OFF"
+reactB.TextColor3 = Color3.fromRGB(200, 200, 210) reactB.TextSize = 11 reactB.Font = Enum.Font.GothamBold
+reactB.Parent = fr Instance.new("UICorner", reactB).CornerRadius = UDim.new(0, 5)
+
+reactB.MouseButton1Click:Connect(function()
+	reactOn = not reactOn
+	reactB.Text = "React: " .. (reactOn and "ON" or "OFF")
+	reactB.BackgroundColor3 = reactOn and Color3.fromRGB(180, 40, 40) or Color3.fromRGB(35, 35, 45)
+end)
+
+-- Before button
+local beforeB = Instance.new("TextButton")
+beforeB.Size = UDim2.new(1, -14, 0, 24) beforeB.Position = UDim2.new(0, 7, 0, 50)
+beforeB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) beforeB.Text = "Before: OFF"
+beforeB.TextColor3 = Color3.fromRGB(200, 200, 210) beforeB.TextSize = 11 beforeB.Font = Enum.Font.GothamBold
+beforeB.Parent = fr Instance.new("UICorner", beforeB).CornerRadius = UDim.new(0, 5)
+
+beforeB.MouseButton1Click:Connect(function()
+	beforeOn = not beforeOn
+	beforeB.Text = "Before: " .. (beforeOn and "ON" or "OFF")
+	beforeB.BackgroundColor3 = beforeOn and Color3.fromRGB(100, 40, 180) or Color3.fromRGB(35, 35, 45)
+end)
+
+-- Update counter display
+task.spawn(function()
+	while _G.__AC_RUN do pcall(function() countL.Text = tostring(counters) end) task.wait(0.3) end
+end)
