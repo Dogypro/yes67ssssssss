@@ -1,0 +1,289 @@
+--[[
+JS AUTO COUNTER v4 — Eye Catching
+===================================
+ONLY triggers on CONFIRMED attacks:
+  - "Swing" effects = enemy is mid-attack near us → counter
+  - "Hit" effects targeting us = counter same frame
+  - Projectiles heading toward us → counter
+  
+NEVER triggers on walk/idle/jump animations.
+One fire per attack. No spam.
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.3) end
+if _G.__AC_CONNS then for _, c in _G.__AC_CONNS do pcall(function() c:Disconnect() end) end end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+local function track(c) if c then table.insert(_G.__AC_CONNS, c) end return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local VIM pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+track(player.CharacterAdded:Connect(function(c) char = c end))
+
+local counterOn = false
+local counters = 0
+local lastFire = 0
+local DEBOUNCE = 0.35
+
+-- ============================================================
+-- FIRE EYE CATCHING
+-- ============================================================
+local function fireCounter()
+	if not counterOn then return false end
+	if (tick() - lastFire) < DEBOUNCE then return false end
+	
+	-- Check if Eye Catching is off cooldown
+	local moveset = char and char:FindFirstChild("Moveset")
+	if moveset then
+		local ec = moveset:FindFirstChild("Eye Catching")
+		if ec then
+			local lastUse = ec:GetAttribute("LastUse") or 0
+			if lastUse > 0 and (tick() - lastUse) < 1 then
+				return false -- still on cooldown
+			end
+		end
+	end
+
+	lastFire = tick()
+
+	-- Cancel current action first so counter can activate
+	pcall(function()
+		local info = char:FindFirstChild("Info")
+		if info then
+			local cancel = info:FindFirstChild("Cancel")
+			if cancel then cancel:Fire() end
+		end
+	end)
+
+	-- Small delay for cancel to process, then press key
+	task.defer(function()
+		pcall(function()
+			if VIM then
+				VIM:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+				task.delay(0.07, function()
+					pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.Three, false, game) end)
+				end)
+			end
+		end)
+	end)
+
+	counters = counters + 1
+	return true
+end
+
+-- ============================================================
+-- HELPER: is this model an enemy near us?
+-- ============================================================
+local function isEnemyNearMe(model, range)
+	if not model or not model:IsA("Model") then return false end
+	if model == char then return false end
+	local eHrp = model:FindFirstChild("HumanoidRootPart")
+	local myHrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not eHrp or not myHrp then return false end
+	return (eHrp.Position - myHrp.Position).Magnitude <= (range or 10)
+end
+
+-- ============================================================
+-- CORE: Listen to ALL Knit service Effects/Hitbox remotes
+-- ============================================================
+pcall(function()
+	local services = RS.Knit.Knit.Services
+	for _, svc in services:GetChildren() do
+		local re = svc:FindFirstChild("RE")
+		if not re then continue end
+		-- Skip our own counter service
+		if svc.Name == "EyeCatchService" then continue end
+
+		local effects = re:FindFirstChild("Effects")
+		if effects and effects:IsA("RemoteEvent") then
+			track(effects.OnClientEvent:Connect(function(effectName, ...)
+				if not counterOn then return end
+				if type(effectName) ~= "string" then return end
+
+				local args = {...}
+				local eName = effectName:lower()
+
+				-- ======================================
+				-- TRIGGER A: "Swing" = enemy mid-attack
+				-- Data shows: Effects("Swing2", attackerModel, number)
+				-- Only fires during ACTUAL attacks
+				-- ======================================
+				if eName:find("swing") or eName:find("slash") or eName:find("throw")
+					or eName:find("punch") or eName:find("kick") or eName:find("strike")
+					or eName:find("rush") or eName:find("charge") or eName:find("dash")
+					or eName:find("launch") or eName:find("smash") or eName:find("slam") then
+					for _, arg in args do
+						if typeof(arg) == "Instance" and arg:IsA("Model") then
+							if isEnemyNearMe(arg, 10) then
+								fireCounter()
+								return
+							end
+						end
+					end
+				end
+
+				-- ======================================
+				-- TRIGGER B: "Hit" targeting US
+				-- Data shows: Effects("Hit", targetModel, number)
+				-- Fires same frame as damage — counter anyway
+				-- ======================================
+				if eName:find("hit") or eName:find("impact") or eName:find("land")
+					or eName:find("connect") or eName:find("grab") then
+					for _, arg in args do
+						if typeof(arg) == "Instance" and arg:IsA("Model") and arg == char then
+							fireCounter()
+							return
+						end
+					end
+				end
+
+				-- ======================================
+				-- TRIGGER C: "Activated" style effects where
+				-- the attacker is very close (within punch range)
+				-- ======================================
+				if eName:find("activat") or eName:find("start") or eName:find("begin")
+					or eName:find("cast") or eName:find("use") then
+					for _, arg in args do
+						if typeof(arg) == "Instance" and arg:IsA("Model") then
+							if isEnemyNearMe(arg, 6) then
+								fireCounter()
+								return
+							end
+						end
+					end
+				end
+			end))
+		end
+
+		-- Activated remote (ability used)
+		local activated = re:FindFirstChild("Activated")
+		if activated and activated:IsA("RemoteEvent") then
+			track(activated.OnClientEvent:Connect(function(...)
+				if not counterOn then return end
+				local args = {...}
+				for _, arg in args do
+					if typeof(arg) == "Instance" and arg:IsA("Model") then
+						-- Enemy activated an ability within melee range
+						if isEnemyNearMe(arg, 7) then
+							fireCounter()
+							return
+						end
+					end
+				end
+			end))
+		end
+
+		-- Hitbox remote (direct hit confirmation)
+		local hitbox = re:FindFirstChild("Hitbox")
+		if hitbox and hitbox:IsA("RemoteEvent") then
+			track(hitbox.OnClientEvent:Connect(function(...)
+				if not counterOn then return end
+				for _, arg in {...} do
+					if typeof(arg) == "Instance" then
+						if arg == char or arg == player or (char and arg:IsDescendantOf(char)) then
+							fireCounter()
+							return
+						end
+					end
+				end
+			end))
+		end
+	end
+end)
+
+-- ============================================================
+-- TRIGGER D: Projectiles in workspace.Effects heading at us
+-- ============================================================
+pcall(function()
+	local eff = workspace:FindFirstChild("Effects")
+	if eff then
+		track(eff.ChildAdded:Connect(function(obj)
+			if not counterOn then return end
+			task.defer(function()
+				pcall(function()
+					if not obj:IsA("BasePart") then return end
+					local myHrp = char and char:FindFirstChild("HumanoidRootPart")
+					if not myHrp then return end
+					local dist = (obj.Position - myHrp.Position).Magnitude
+					if dist > 15 then return end
+					-- Check if it's moving toward us
+					local vel = obj.AssemblyLinearVelocity
+					if vel.Magnitude > 10 then
+						local dir = (myHrp.Position - obj.Position).Unit
+						if vel.Unit:Dot(dir) > 0.5 then
+							fireCounter()
+						end
+					end
+				end)
+			end)
+		end))
+	end
+end)
+
+-- ============================================================
+-- GUI
+-- ============================================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("AC4"):Destroy() end)
+pcall(function() player.PlayerGui:FindFirstChild("AC4"):Destroy() end)
+local guiParent
+local ok1 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC4" g.Parent=game:GetService("CoreGui") guiParent=g end)
+if not ok1 then
+	local ok2 = pcall(function() local g = Instance.new("ScreenGui") g.Name="AC4" g.Parent=gethui() guiParent=g end)
+	if not ok2 then local g = Instance.new("ScreenGui") g.Name="AC4" g.ResetOnSpawn=false g.Parent=player.PlayerGui guiParent=g end
+end
+guiParent.ResetOnSpawn = false
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 160, 0, 70)
+fr.Position = UDim2.new(1, -170, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+local stk = Instance.new("UIStroke") stk.Color=Color3.fromRGB(80,50,100) stk.Thickness=1 stk.Parent=fr
+
+local dragging, dragStart, startPos
+track(fr.InputBegan:Connect(function(i)
+	if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+		dragging=true dragStart=i.Position startPos=fr.Position
+		i.Changed:Connect(function() if i.UserInputState==Enum.UserInputState.End then dragging=false end end)
+	end
+end))
+track(UIS.InputChanged:Connect(function(i)
+	if dragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+		local d=i.Position-dragStart fr.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
+	end
+end))
+
+local statL = Instance.new("TextLabel")
+statL.Size=UDim2.new(1,-10,0,12) statL.Position=UDim2.new(0,5,0,5) statL.BackgroundTransparency=1
+statL.Text="AUTO COUNTER" statL.TextColor3=Color3.fromRGB(255,180,50) statL.TextSize=12
+statL.Font=Enum.Font.GothamBold statL.TextXAlignment=Enum.TextXAlignment.Left statL.Parent=fr
+
+local countL = Instance.new("TextLabel")
+countL.Size=UDim2.new(1,-10,0,10) countL.Position=UDim2.new(0,5,0,18) countL.BackgroundTransparency=1
+countL.Text="Counters: 0" countL.TextColor3=Color3.fromRGB(140,140,150) countL.TextSize=9
+countL.Font=Enum.Font.Gotham countL.TextXAlignment=Enum.TextXAlignment.Left countL.Parent=fr
+
+local toggleB = Instance.new("TextButton")
+toggleB.Size=UDim2.new(1,-10,0,24) toggleB.Position=UDim2.new(0,5,0,34)
+toggleB.BackgroundColor3=Color3.fromRGB(40,40,50) toggleB.Text="OFF"
+toggleB.TextColor3=Color3.new(1,1,1) toggleB.TextSize=12 toggleB.Font=Enum.Font.GothamBold
+toggleB.Parent=fr Instance.new("UICorner",toggleB).CornerRadius=UDim.new(0,5)
+
+toggleB.MouseButton1Click:Connect(function()
+	counterOn = not counterOn
+	toggleB.Text = counterOn and "ON" or "OFF"
+	toggleB.BackgroundColor3 = counterOn and Color3.fromRGB(200,50,50) or Color3.fromRGB(40,40,50)
+end)
+
+task.spawn(function()
+	while _G.__AC_RUN do
+		pcall(function() countL.Text = "Counters: " .. counters end)
+		task.wait(0.3)
+	end
+end)
