@@ -1,0 +1,96 @@
+-- STEALTH DUMP v2: slow, quiet, targeted
+-- Decompiles ONE script every 3-5 seconds (looks like normal game lag)
+-- Only targets the scripts we actually need, not everything
+
+local DELAY = math.random(3, 5) -- seconds between each decompile
+local printed = 0
+local cur = {}
+
+local function out(s)
+	table.insert(cur, tostring(s))
+	printed = printed + 1
+end
+
+local function tryDecompile(obj)
+	local ok, src = pcall(decompile, obj)
+	if not ok or not src or #src < 10 then
+		out("=== SKIP: " .. obj:GetFullName() .. " ===")
+		return
+	end
+	out("=== SOURCE: " .. obj:GetFullName() .. " ===")
+	for line in src:gmatch("[^\n]*") do out(line) end
+	out("=== END ===")
+end
+
+-- ONLY the scripts we need for combat/counter
+local targets = {}
+
+-- Combat scripts (how hits work)
+pcall(function()
+	local ctrl = game.StarterPlayer.StarterPlayerScripts.Controllers
+	-- Combat folder
+	for _, obj in ctrl.Combat:GetDescendants() do
+		if obj:IsA("ModuleScript") then table.insert(targets, obj) end
+	end
+	-- Charles/Custom moveset
+	for _, folder in {"Charles", "Custom"} do
+		pcall(function()
+			for _, obj in ctrl.Moveset[folder]:GetDescendants() do
+				if obj:IsA("ModuleScript") then table.insert(targets, obj) end
+			end
+		end)
+	end
+	-- Movement (dodge/dash)
+	pcall(function() table.insert(targets, ctrl.Character.MovementController) end)
+	-- FX
+	pcall(function() table.insert(targets, ctrl.FXController) end)
+end)
+
+-- Knit services (how abilities fire server-side)
+pcall(function()
+	local services = game.ReplicatedStorage.Knit.Knit.Services
+	for _, svc in services:GetChildren() do
+		-- Only combat-related services
+		local name = svc.Name:lower()
+		if name:find("eye") or name:find("catch") or name:find("combat")
+			or name:find("hit") or name:find("block") or name:find("melee")
+			or name:find("dash") or name:find("counter") or name:find("parry")
+			or name:find("despair") or name:find("shutup") or name:find("sacrileg")
+			or name:find("stun") or name:find("guard") or name:find("dodge") then
+			for _, obj in svc:GetDescendants() do
+				if obj:IsA("ModuleScript") then table.insert(targets, obj) end
+			end
+		end
+	end
+end)
+
+-- KnitRunClient
+pcall(function() table.insert(targets, game.StarterPlayer.StarterPlayerScripts.KnitRunClient) end)
+
+warn("[SD] Found " .. #targets .. " targets. ETA: ~" .. (#targets * DELAY) .. "s")
+warn("[SD] Running silently... don't spam anything else")
+
+-- Decompile one at a time with random delays
+task.spawn(function()
+	for i, obj in targets do
+		if not _G.__SD_RUN then break end
+		pcall(function() tryDecompile(obj) end)
+		-- Random delay to look natural
+		task.wait(DELAY + math.random() * 2)
+		-- Brief progress (not spammy)
+		if i % 5 == 0 then warn("[SD] " .. i .. "/" .. #targets) end
+	end
+
+	-- Save when done
+	local full = table.concat(cur, "\n")
+	warn("[SD] DONE: " .. printed .. " lines, " .. #full .. " chars")
+
+	-- Save to ONE file (small since we only targeted key scripts)
+	pcall(function() writefile("js_combat_dump.txt", full) warn("[SD] SAVED js_combat_dump.txt") end)
+	pcall(function() setclipboard(full) warn("[SD] COPIED to clipboard") end)
+
+	warn("[SD] === FINISHED ===")
+end)
+
+_G.__SD_RUN = true
+-- To stop early: _G.__SD_RUN = false
