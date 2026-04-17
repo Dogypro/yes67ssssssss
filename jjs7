@@ -1,0 +1,162 @@
+--[[
+    JS AUTO COUNTER v12.1 (Knit-Hook + Menu)
+    ========================================
+]]
+
+if _G.__AC_RUN then _G.__AC_RUN = false task.wait(0.5) end
+_G.__AC_RUN = true
+_G.__AC_CONNS = {}
+
+local function track(c) table.insert(_G.__AC_CONNS, c) return c end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local VIM = game:GetService("VirtualInputManager")
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+
+local Knit = require(RS:WaitForChild("Knit"):WaitForChild("Knit"))
+
+-- Toggles
+local beforeOn = true
+local reactOn = false
+local MAX_DISTANCE = 18
+
+local function getCounterKey()
+    local key = Enum.KeyCode.Three -- Default
+    pcall(function()
+        local moveset = char:FindFirstChild("Moveset")
+        local ec = moveset and moveset:FindFirstChild("Eye Catching")
+        if ec then
+            local k = ec:GetAttribute("Key")
+            local map = {Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four}
+            key = map[k] or key
+        end
+    end)
+    return key
+end
+
+local function fireCounter()
+    if not _G.__AC_RUN then return end
+    local key = getCounterKey()
+    
+    VIM:SendKeyEvent(true, key, false, game)
+    task.wait(0.05)
+    VIM:SendKeyEvent(false, key, false, game)
+    
+    pcall(function()
+        local ec = char.Moveset:FindFirstChild("Eye Catching")
+        local svcName = ec:GetAttribute("Service")
+        local svc = RS.Knit.Knit.Services:FindFirstChild(svcName)
+        if svc and svc.RE:FindFirstChild("Activated") then
+            svc.RE.Activated:FireServer()
+        end
+    end)
+end
+
+-- Hooks
+Knit.OnStart():andThen(function()
+    local HitboxService = Knit.GetService("HitboxService")
+    local HandicapService = Knit.GetService("HandicapService")
+
+    track(HitboxService.Hitbox:Connect(function(attacker, p20, p21, p22, p23)
+        if not beforeOn or attacker == char then return end
+        
+        local enemyRoot = attacker:FindFirstChild("HumanoidRootPart")
+        local myRoot = char:FindFirstChild("HumanoidRootPart")
+        
+        if enemyRoot and myRoot then
+            local dist = (enemyRoot.Position - myRoot.Position).Magnitude
+            if dist <= MAX_DISTANCE then
+                fireCounter()
+            end
+        end
+    end))
+
+    track(HandicapService.Effects:Connect(function(part, effectType, attacker, p4, p5)
+        if not beforeOn or effectType ~= "Swing" then return end
+        
+        if attacker and attacker ~= char and attacker:IsA("Model") then
+            local enemyRoot = attacker:FindFirstChild("HumanoidRootPart")
+            local myRoot = char:FindFirstChild("HumanoidRootPart")
+            
+            if enemyRoot and myRoot then
+                local dist = (enemyRoot.Position - myRoot.Position).Magnitude
+                if dist <= MAX_DISTANCE then
+                    fireCounter()
+                end
+            end
+        end
+    end))
+end)
+
+track(char:WaitForChild("Humanoid").HealthChanged:Connect(function(hp)
+    if reactOn and hp < char.Humanoid.Health then
+        fireCounter()
+    end
+end))
+
+-- ============================================================
+-- THE GUI
+-- ============================================================
+local sg = Instance.new("ScreenGui")
+sg.Name = "AutoCounterGUI"
+sg.ResetOnSpawn = false
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 160, 0, 110)
+frame.Position = UDim2.new(0.75, 0, 0.3, 0)
+frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = sg
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Text = "Knit Counter v12.1"
+title.Font = Enum.Font.SourceSansBold
+title.TextSize = 15
+title.BorderSizePixel = 0
+title.Parent = frame
+
+local function createButton(text, yPos, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -10, 0, 30)
+    btn.Position = UDim2.new(0, 5, 0, yPos)
+    btn.Text = text
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextSize = 14
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    btn.BorderSizePixel = 0
+    btn.Parent = frame
+    btn.MouseButton1Click:Connect(function()
+        callback(btn)
+    end)
+    return btn
+end
+
+local btnBefore = createButton("Before: ON", 35, function(btn)
+    beforeOn = not beforeOn
+    btn.Text = "Before: " .. (beforeOn and "ON" or "OFF")
+    btn.BackgroundColor3 = beforeOn and Color3.fromRGB(90, 40, 140) or Color3.fromRGB(45, 45, 55)
+end)
+btnBefore.BackgroundColor3 = Color3.fromRGB(90, 40, 140)
+
+local btnReact = createButton("React: OFF", 70, function(btn)
+    reactOn = not reactOn
+    btn.Text = "React: " .. (reactOn and "ON" or "OFF")
+    btn.BackgroundColor3 = reactOn and Color3.fromRGB(140, 40, 40) or Color3.fromRGB(45, 45, 55)
+end)
+
+-- Safe UI execution for executors
+local success, err = pcall(function()
+    sg.Parent = game:GetService("CoreGui")
+end)
+if not success then
+    sg.Parent = player:WaitForChild("PlayerGui")
+end
