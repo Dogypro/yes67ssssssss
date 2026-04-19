@@ -1,0 +1,32 @@
+local url = "https://api.jnkie.com/api/v1/luascripts/public/13ad11541abc1f80a6c26d5bde373a8932619755eae33667d9e3d0f5d8311462/download"
+
+local source
+local ok, err = pcall(function()
+    if request then
+        source = request({Url = url, Method = "GET"}).Body
+    elseif http_request then
+        source = http_request({Url = url, Method = "GET"}).Body
+    elseif syn and syn.request then
+        source = syn.request({Url = url, Method = "GET"}).Body
+    elseif game.HttpGet then
+        source = game:HttpGet(url)
+    end
+end)
+
+if not ok or not source then
+    warn("fetch failed: " .. tostring(err))
+    return
+end
+
+-- write to file (no printing)
+if writefile then
+    writefile("fetched_source.lua", source)
+    warn("saved to workspace/fetched_source.lua (" .. #source .. " chars)")
+end
+
+-- clipboard
+pcall(function()
+    if setclipboard then setclipboard(source)
+    elseif toclipboard then toclipboard(source) end
+    warn("copied to clipboard")
+end)
