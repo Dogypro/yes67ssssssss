@@ -1,0 +1,256 @@
+-- LocalScript
+local URL = "https://api.jnkie.com/api/v1/luascripts/public/13ad11541abc1f80a6c26d5bde373a8932619755eae33667d9e3d0f5d8311462/download"
+
+local Players = game:GetService("Players")
+local LogService = game:GetService("LogService")
+local UIS = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+pcall(function() playerGui:FindFirstChild("LiveConsoleUI"):Destroy() end)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "LiveConsoleUI"
+gui.ResetOnSpawn = false
+gui.Parent = playerGui
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 640, 0, 400)
+main.Position = UDim2.new(0.5, -320, 0.5, -200)
+main.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 32)
+titleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 1, 0)
+title.BackgroundTransparency = 1
+title.Text = "Console"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 18
+title.Font = Enum.Font.SourceSansSemibold
+title.Parent = titleBar
+
+local closeButton = Instance.new("TextButton")
+closeButton.Size = UDim2.new(0, 32, 0, 32)
+closeButton.Position = UDim2.new(1, -32, 0, 0)
+closeButton.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
+closeButton.BorderSizePixel = 0
+closeButton.Text = "X"
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.TextSize = 16
+closeButton.Font = Enum.Font.SourceSansBold
+closeButton.Parent = main
+closeButton.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+local output = Instance.new("TextBox")
+output.Size = UDim2.new(1, -20, 1, -80)
+output.Position = UDim2.new(0, 10, 0, 42)
+output.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+output.BorderSizePixel = 0
+output.TextColor3 = Color3.fromRGB(230, 230, 230)
+output.TextSize = 16
+output.Font = Enum.Font.Code
+output.TextXAlignment = Enum.TextXAlignment.Left
+output.TextYAlignment = Enum.TextYAlignment.Top
+output.ClearTextOnFocus = false
+output.MultiLine = true
+output.TextWrapped = false
+output.TextEditable = false
+output.RichText = false
+output.Text = ""
+output.Parent = main
+
+-- ============================================
+-- BOTTOM BUTTON ROW
+-- ============================================
+local function makeBtn(text, xOffset, color)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 90, 0, 28)
+    b.Position = UDim2.new(0, xOffset, 1, -34)
+    b.BackgroundColor3 = color or Color3.fromRGB(55, 55, 55)
+    b.BorderSizePixel = 0
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.TextSize = 15
+    b.Font = Enum.Font.SourceSansSemibold
+    b.Text = text
+    b.Parent = main
+    return b
+end
+
+local fetchButton = makeBtn("Fetch",     10,  Color3.fromRGB(40, 80, 50))
+local copyButton  = makeBtn("Copy",      105, Color3.fromRGB(55, 55, 55))
+local clearButton = makeBtn("Clear",     200, Color3.fromRGB(55, 55, 55))
+local viewButton  = makeBtn("View Src",  295, Color3.fromRGB(50, 60, 90))
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -400, 0, 28)
+status.Position = UDim2.new(0, 395, 1, -34)
+status.BackgroundTransparency = 1
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextColor3 = Color3.fromRGB(180, 180, 180)
+status.TextSize = 14
+status.Font = Enum.Font.SourceSans
+status.Text = ""
+status.Parent = main
+
+-- ============================================
+-- CONSOLE LOG CAPTURE
+-- ============================================
+local lines = {}
+local function rebuildText()
+    output.Text = table.concat(lines, "\n")
+    output.CursorPosition = #output.Text + 1
+end
+
+local function addLine(messageType, message)
+    local prefix = "[" .. tostring(messageType) .. "] "
+    table.insert(lines, prefix .. message)
+    if #lines > 300 then table.remove(lines, 1) end
+    rebuildText()
+end
+
+LogService.MessageOut:Connect(function(message, messageType)
+    addLine(messageType.Name, message)
+end)
+
+-- ============================================
+-- FETCH
+-- ============================================
+local fetchedSource = nil
+local viewingSource = false
+local savedLogLines = nil
+
+local function setStatus(txt)
+    status.Text = txt
+    task.delay(3, function()
+        if status.Text == txt then status.Text = "" end
+    end)
+end
+
+fetchButton.MouseButton1Click:Connect(function()
+    print("[Fetch] starting request to " .. URL)
+    fetchButton.AutoButtonColor = false
+    fetchButton.Text = "..."
+
+    task.spawn(function()
+        local req = request or http_request or (syn and syn.request) or (http and http.request)
+        local source, code, err
+
+        if req then
+            local ok, res = pcall(req, {
+                Url = URL,
+                Method = "GET",
+                Headers = {["User-Agent"] = "Roblox/WinInet"}
+            })
+            if ok and res then
+                source = res.Body
+                code = res.StatusCode
+            else
+                err = tostring(res)
+            end
+        elseif game.HttpGet then
+            local ok, res = pcall(function() return game:HttpGet(URL) end)
+            if ok then source = res else err = tostring(res) end
+        else
+            err = "no HTTP function available in this executor"
+        end
+
+        fetchButton.AutoButtonColor = true
+        fetchButton.Text = "Fetch"
+
+        if not source then
+            warn("[Fetch] failed: " .. tostring(err))
+            setStatus("Fetch failed.")
+            return
+        end
+
+        fetchedSource = source
+        print(string.format("[Fetch] ok — status %s, %d chars. Click 'View Src' to display.",
+            tostring(code or "?"), #source))
+        setStatus(string.format("Fetched %d chars.", #source))
+    end)
+end)
+
+-- ============================================
+-- VIEW SRC — toggles the text box between log view and fetched source
+-- ============================================
+viewButton.MouseButton1Click:Connect(function()
+    if not fetchedSource then
+        setStatus("Nothing fetched yet.")
+        return
+    end
+    if not viewingSource then
+        savedLogLines = output.Text
+        -- Truncate display to avoid UI lag on huge files — full source still in memory
+        local display = fetchedSource
+        if #display > 80000 then
+            display = display:sub(1, 80000) .. "\n\n-- [view truncated, full source intact for Copy] --"
+        end
+        output.Text = display
+        output.CursorPosition = 1
+        viewButton.Text = "View Log"
+        viewingSource = true
+        setStatus("Viewing source.")
+    else
+        output.Text = savedLogLines or ""
+        viewButton.Text = "View Src"
+        viewingSource = false
+        setStatus("Viewing log.")
+    end
+end)
+
+-- ============================================
+-- COPY — copies fetched source if available, otherwise the visible text
+-- ============================================
+copyButton.MouseButton1Click:Connect(function()
+    local text = fetchedSource or output.Text
+    if typeof(setclipboard) == "function" then
+        pcall(function() setclipboard(text) end)
+        setStatus("Copied to clipboard.")
+    else
+        output:CaptureFocus()
+        output.SelectionStart = 1
+        output.CursorPosition = #output.Text + 1
+        setStatus("Clipboard unavailable — text selected.")
+    end
+end)
+
+clearButton.MouseButton1Click:Connect(function()
+    lines = {}
+    if not viewingSource then rebuildText() end
+    setStatus("Cleared.")
+end)
+
+-- ============================================
+-- DRAG
+-- ============================================
+local dragging, dragStart, startPos
+local function beginDrag(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end
+titleBar.InputBegan:Connect(beginDrag)
+title.InputBegan:Connect(beginDrag)
+
+UIS.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
