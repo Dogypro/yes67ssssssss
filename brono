@@ -1,0 +1,34 @@
+local url = "https://api.jnkie.com/api/v1/luascripts/public/13ad11541abc1f80a6c26d5bde373a8932619755eae33667d9e3d0f5d8311462/download"
+
+-- Try the common executor HTTP functions in order
+local source
+
+local ok, err = pcall(function()
+    if game.HttpGet then
+        source = game:HttpGet(url)
+    elseif http_request then
+        source = http_request({Url = url, Method = "GET"}).Body
+    elseif request then
+        source = request({Url = url, Method = "GET"}).Body
+    elseif syn and syn.request then
+        source = syn.request({Url = url, Method = "GET"}).Body
+    else
+        error("No HTTP function available")
+    end
+end)
+
+if not ok or not source then
+    warn("Failed to fetch: " .. tostring(err))
+    return
+end
+
+print("===== FETCHED SOURCE (" .. #source .. " chars) =====")
+print(source)
+
+-- Copy to clipboard if available so you can paste it here
+pcall(function()
+    if setclipboard then setclipboard(source)
+    elseif toclipboard then toclipboard(source)
+    elseif Clipboard and Clipboard.set then Clipboard.set(source) end
+    print("[copied to clipboard]")
+end)
