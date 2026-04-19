@@ -1,0 +1,466 @@
+-- ============================================
+-- AUTO EYE CATCHING v2 — Charles counter skill
+-- Built from reverse-engineering the actual game logic.
+--
+-- Key findings from the code dump:
+--   • Eye Catching is Charles's 3rd skill — reactive counter
+--   • Hits during active window → attacker "Fades" (misses) + Hit VFX
+--   • _G.Settings.AutoUse controls how skills activate:
+--       true  → keypress immediately activates
+--       false → keypress STAGES, mouse click activates (default for most)
+--     ➜ We handle BOTH by pressing key + clicking mouse1
+--   • State flags are BoolValues under character.Info (not attributes)
+--   • Real hitboxes are clones of RS.Utils.Hitbox.Hitsphere in workspace.Effects
+--   • Skill Instance in character.Moveset has Key + Service attributes
+-- ============================================
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+
+-- ============================================
+-- TUNABLES
+-- ============================================
+local FIRE_COOLDOWN     = 0.35  -- min seconds between fires (skill has its own CD server-side)
+local REACT_RANGE       = 16    -- max range we'll react to an aimed attacker
+local FACING_DOT_CLOSE  = 0.72  -- melee-range facing requirement (~44° cone)
+local FACING_DOT_FAR    = 0.88  -- long-range facing requirement (~28° cone)
+local MELEE_RANGE       = 8
+local HITSPHERE_BUFFER  = 3     -- extra studs beyond hitsphere radius to react
+local PROJ_DANGER_TIME  = 0.22
+local USE_MOUSE_CLICK   = true  -- include mouse1 press for AutoUse=false (recommended)
+
+-- ============================================
+-- RUNTIME STATE
+-- ============================================
+local ecOn = false
+local fires = 0
+local lastFire = 0
+local lastSelfAction = 0
+
+-- ============================================
+-- HITSPHERE TEMPLATE — for template matching
+-- ============================================
+local hitsphereTemplate
+pcall(function()
+    hitsphereTemplate = RS:FindFirstChild("Utils")
+        and RS.Utils:FindFirstChild("Hitbox")
+        and RS.Utils.Hitbox:FindFirstChild("Hitsphere")
+end)
+
+-- ============================================
+-- FIND THE EYE CATCHING SKILL
+-- Iterates character.Moveset to find it by name, returns:
+--   skillInstance, keycode (0x31-0x34)
+-- Cached until character changes.
+-- ============================================
+local cachedSkill, cachedKey = nil, nil
+
+local function findEyeCatching()
+    local char = LocalPlayer.Character
+    if not char then return nil, nil end
+    if cachedSkill and cachedSkill.Parent then return cachedSkill, cachedKey end
+
+    local moveset = char:FindFirstChild("Moveset")
+    if not moveset then return nil, nil end
+
+    for _, skill in moveset:GetChildren() do
+        local n = skill.Name:lower():gsub("%s", "")
+        if n == "eyecatching" or n == "eyecatch" then
+            local k = skill:GetAttribute("Key")
+            local kc
+            if k == 1 then kc = 0x31
+            elseif k == 2 then kc = 0x32
+            elseif k == 3 then kc = 0x33
+            elseif k == 4 then kc = 0x34
+            else kc = 0x33 end -- fallback
+            cachedSkill, cachedKey = skill, kc
+            return skill, kc
+        end
+    end
+    return nil, nil
+end
+
+-- ============================================
+-- STATE GATING (using REAL game flags)
+-- ============================================
+local function hasInfoFlag(char, flagName)
+    if not char then return false end
+    local info = char:FindFirstChild("Info")
+    if not info then return false end
+    return info:FindFirstChild(flagName) ~= nil
+end
+
+local function canFire()
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+
+    -- Skip if already countering (IFrame/dodging from a previous fire)
+    if hasInfoFlag(char, "IFrame") then return false end
+    -- Skip if stunned / dead / can't input
+    if hasInfoFlag(char, "Stun") then return false end
+    -- Ragdoll value > 0 means we're ragdolled
+    local rag = char:GetAttribute("Ragdoll")
+    if rag and rag > 0 then return false end
+    -- Dead check
+    if char:GetAttribute("Dead") then return false end
+    -- Cooldown
+    if (tick() - lastFire) < FIRE_COOLDOWN then return false end
+
+    return true
+end
+
+-- ============================================
+-- FIRE — handles both AutoUse modes
+--   1. Press the skill key (stages in AutoUse=false, activates in true)
+--   2. Small delay, then click mouse1 (activates the staged skill)
+--   3. Release everything
+-- ============================================
+local function fireEyeCatching(reason)
+    if not ecOn then return end
+    if not canFire() then return end
+
+    local skill, key = findEyeCatching()
+    if not skill or not key then return end
+
+    lastFire = tick()
+    fires = fires + 1
+
+    keypress(key)
+
+    -- Detect AutoUse setting if accessible
+    local needsClick = USE_MOUSE_CLICK
+    pcall(function()
+        if _G and _G.Settings and _G.Settings.AutoUse == true then
+            needsClick = false
+        end
+    end)
+
+    if needsClick then
+        task.delay(0.025, function()
+            pcall(function()
+                if mouse1click then
+                    mouse1click()
+                elseif mouse1press and mouse1release then
+                    mouse1press()
+                    task.wait(0.02)
+                    mouse1release()
+                end
+            end)
+        end)
+    end
+
+    task.delay(0.1, function() keyrelease(key) end)
+end
+
+-- ============================================
+-- SELF-ACTION TRACKING
+-- Anything we do that spawns hitboxes/uses skills — ignore for 0.5s
+-- ============================================
+UIS.InputBegan:Connect(function(i, gpe)
+    if gpe then return end
+    if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.KeyCode == Enum.KeyCode.F or i.KeyCode == Enum.KeyCode.R
+        or i.KeyCode == Enum.KeyCode.E or i.KeyCode == Enum.KeyCode.G
+        or i.KeyCode == Enum.KeyCode.One or i.KeyCode == Enum.KeyCode.Two
+        or i.KeyCode == Enum.KeyCode.Three or i.KeyCode == Enum.KeyCode.Four then
+        lastSelfAction = tick()
+    end
+end)
+
+local function isMyOwn(part)
+    if (tick() - lastSelfAction) < 0.5 then return true end
+    local owner = part:GetAttribute("Owner") or part:GetAttribute("Player") or part:GetAttribute("Caster")
+    if owner == LocalPlayer.Name or owner == LocalPlayer.UserId then return true end
+    return false
+end
+
+-- ============================================
+-- HITSPHERE DETECTION (gold standard)
+-- A Hitsphere clone that overlaps us = guaranteed incoming hit
+-- ============================================
+local processed = setmetatable({}, {__mode = "k"})
+
+local function isLikelyHitsphere(part)
+    if not part:IsA("BasePart") then return false end
+    if part.Name == "Hitsphere" then return true end
+    if hitsphereTemplate then
+        if part.Shape == hitsphereTemplate.Shape
+           and part.Material == hitsphereTemplate.Material
+           and part.Name == hitsphereTemplate.Name then
+            return true
+        end
+    end
+    return false
+end
+
+local function watchEffectsChild(part)
+    if processed[part] then return end
+    if not part:IsA("BasePart") then return end
+    processed[part] = true
+
+    task.spawn(function()
+        if not ecOn then return end
+        if isMyOwn(part) then return end
+
+        local myChar = LocalPlayer.Character
+        if not myChar then return end
+        local myHRP = myChar:FindFirstChild("HumanoidRootPart")
+        if not myHRP then return end
+
+        -- Branch 1: Hitsphere → react instantly if within radius + buffer
+        if isLikelyHitsphere(part) then
+            task.wait() -- let position settle one frame
+            if not part.Parent then return end
+            local dist = (part.Position - myHRP.Position).Magnitude
+            local radius = part.Size.Magnitude / 2
+            if dist <= radius + HITSPHERE_BUFFER then
+                fireEyeCatching("hitsphere")
+            end
+            return
+        end
+
+        -- Branch 2: Generic overlap / projectile tracking
+        local start = tick()
+        while part.Parent and (tick() - start) < 0.6 do
+            if not ecOn then return end
+            local dist = (part.Position - myHRP.Position).Magnitude
+            if dist < (part.Size.Magnitude + 8) then
+                -- Overlap check
+                local params = OverlapParams.new()
+                params.FilterType = Enum.RaycastFilterType.Include
+                params.FilterDescendantsInstances = {myChar}
+                params.MaxParts = 1
+                local ok, hits = pcall(function()
+                    return workspace:GetPartsInPart(part, params)
+                end)
+                if ok and hits and #hits > 0 then
+                    fireEyeCatching("overlap")
+                    return
+                end
+                -- Projectile aimed at us
+                local vel = part.AssemblyLinearVelocity
+                if vel.Magnitude > 15 then
+                    local toMe = myHRP.Position - part.Position
+                    local d = toMe.Magnitude
+                    if d < 12 then
+                        local aimed = vel.Unit:Dot(toMe.Unit)
+                        local timeToHit = d / vel.Magnitude
+                        if aimed > 0.78 and timeToHit < PROJ_DANGER_TIME then
+                            fireEyeCatching("projectile")
+                            return
+                        end
+                    end
+                end
+            end
+            task.wait(0.03)
+        end
+    end)
+end
+
+local function monitorEffects()
+    local eff = workspace:FindFirstChild("Effects")
+    if not eff then return end
+    for _, c in eff:GetChildren() do watchEffectsChild(c) end
+    eff.ChildAdded:Connect(watchEffectsChild)
+end
+monitorEffects()
+workspace.ChildAdded:Connect(function(c)
+    if c.Name == "Effects" then
+        task.wait(0.1)
+        monitorEffects()
+    end
+end)
+
+-- ============================================
+-- ANIM WATCH (tight filters)
+-- ============================================
+local SAFE = {}
+for _, id in {"180435571","180435792","15621270146","7012721719","180436334","9442520397","178130996"} do
+    SAFE[id] = true
+end
+
+local function isCombatAnim(track)
+    if not track or not track.Animation then return false end
+    local id = track.Animation.AnimationId
+    if not id then return false end
+    local n = id:match("%d+")
+    return n and not SAFE[n]
+end
+
+local function watchPlayer(p)
+    if p == LocalPlayer then return end
+    local function onChar(char)
+        pcall(function()
+            local hum = char:WaitForChild("Humanoid", 10)
+            if not hum then return end
+            local animator = hum:WaitForChild("Animator", 5)
+            if not animator then return end
+            animator.AnimationPlayed:Connect(function(track)
+                if not ecOn then return end
+                if not isCombatAnim(track) then return end
+                local myChar = LocalPlayer.Character
+                if not myChar then return end
+                local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+                local theirRoot = char:FindFirstChild("HumanoidRootPart")
+                if not myRoot or not theirRoot then return end
+                local delta = myRoot.Position - theirRoot.Position
+                local dist = delta.Magnitude
+                if dist > REACT_RANGE or dist < 0.1 then return end
+                local toMe = delta.Unit
+                local theirDot = theirRoot.CFrame.LookVector:Dot(toMe)
+                local requiredDot = dist <= MELEE_RANGE and FACING_DOT_CLOSE or FACING_DOT_FAR
+                if theirDot >= requiredDot then
+                    fireEyeCatching("anim")
+                end
+            end)
+        end)
+    end
+    if p.Character then onChar(p.Character) end
+    p.CharacterAdded:Connect(onChar)
+end
+
+for _, p in Players:GetPlayers() do watchPlayer(p) end
+Players.PlayerAdded:Connect(watchPlayer)
+
+-- ============================================
+-- CHARACTER RESPAWN
+-- ============================================
+LocalPlayer.CharacterAdded:Connect(function(char)
+    character = char
+    cachedSkill, cachedKey = nil, nil
+    task.wait(0.6)
+    findEyeCatching() -- re-cache
+end)
+
+-- ============================================
+-- GUI
+-- ============================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("ECXv2"):Destroy() end)
+pcall(function() LocalPlayer.PlayerGui:FindFirstChild("ECXv2"):Destroy() end)
+
+local guiParent
+local ok1 = pcall(function()
+    local g = Instance.new("ScreenGui")
+    g.Name = "ECXv2" g.ResetOnSpawn = false
+    g.Parent = game:GetService("CoreGui")
+    guiParent = g
+end)
+if not ok1 then
+    local g = Instance.new("ScreenGui")
+    g.Name = "ECXv2" g.ResetOnSpawn = false
+    g.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    guiParent = g
+end
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 180, 0, 108)
+fr.Position = UDim2.new(1, -190, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", fr).Color = Color3.fromRGB(160, 90, 180)
+
+local dragging, dragStart, startPos
+fr.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = true dragStart = i.Position startPos = fr.Position
+        i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+
+local titleL = Instance.new("TextLabel")
+titleL.Size = UDim2.new(0.6, 0, 0, 12) titleL.Position = UDim2.new(0, 8, 0, 4)
+titleL.BackgroundTransparency = 1 titleL.Text = "EYE CATCHING v2"
+titleL.TextColor3 = Color3.fromRGB(255, 180, 60)
+titleL.TextSize = 10 titleL.Font = Enum.Font.GothamBold
+titleL.TextXAlignment = Enum.TextXAlignment.Left titleL.Parent = fr
+
+local countL = Instance.new("TextLabel")
+countL.Size = UDim2.new(0.4, -8, 0, 12) countL.Position = UDim2.new(0.6, 0, 0, 4)
+countL.BackgroundTransparency = 1 countL.Text = "0"
+countL.TextColor3 = Color3.fromRGB(140, 140, 150)
+countL.TextSize = 10 countL.Font = Enum.Font.Gotham
+countL.TextXAlignment = Enum.TextXAlignment.Right countL.Parent = fr
+
+local keyL = Instance.new("TextLabel")
+keyL.Size = UDim2.new(1, -16, 0, 12) keyL.Position = UDim2.new(0, 8, 0, 18)
+keyL.BackgroundTransparency = 1 keyL.Text = "Skill: searching..."
+keyL.TextColor3 = Color3.fromRGB(180, 180, 200)
+keyL.TextSize = 10 keyL.Font = Enum.Font.Gotham
+keyL.TextXAlignment = Enum.TextXAlignment.Left keyL.Parent = fr
+
+local stateL = Instance.new("TextLabel")
+stateL.Size = UDim2.new(1, -16, 0, 12) stateL.Position = UDim2.new(0, 8, 0, 32)
+stateL.BackgroundTransparency = 1 stateL.Text = "State: clear"
+stateL.TextColor3 = Color3.fromRGB(160, 220, 160)
+stateL.TextSize = 10 stateL.Font = Enum.Font.Gotham
+stateL.TextXAlignment = Enum.TextXAlignment.Left stateL.Parent = fr
+
+local hsL = Instance.new("TextLabel")
+hsL.Size = UDim2.new(1, -16, 0, 12) hsL.Position = UDim2.new(0, 8, 0, 46)
+hsL.BackgroundTransparency = 1
+hsL.Text = hitsphereTemplate and "Hitsphere: detected" or "Hitsphere: NOT found"
+hsL.TextColor3 = hitsphereTemplate and Color3.fromRGB(120, 220, 120) or Color3.fromRGB(230, 130, 130)
+hsL.TextSize = 10 hsL.Font = Enum.Font.Gotham
+hsL.TextXAlignment = Enum.TextXAlignment.Left hsL.Parent = fr
+
+local toggleB = Instance.new("TextButton")
+toggleB.Size = UDim2.new(1, -14, 0, 28) toggleB.Position = UDim2.new(0, 7, 0, 62)
+toggleB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) toggleB.Text = "OFF"
+toggleB.TextColor3 = Color3.fromRGB(200, 200, 210) toggleB.TextSize = 13 toggleB.Font = Enum.Font.GothamBold
+toggleB.Parent = fr Instance.new("UICorner", toggleB).CornerRadius = UDim.new(0, 6)
+toggleB.MouseButton1Click:Connect(function()
+    ecOn = not ecOn
+    toggleB.Text = ecOn and "ON" or "OFF"
+    toggleB.BackgroundColor3 = ecOn and Color3.fromRGB(160, 60, 180) or Color3.fromRGB(35, 35, 45)
+end)
+
+-- Live status
+task.spawn(function()
+    while true do
+        pcall(function()
+            countL.Text = tostring(fires)
+
+            local skill, key = findEyeCatching()
+            if skill and key then
+                local slot = string.char(key)
+                keyL.Text = "Skill: '" .. skill.Name .. "' @ key " .. slot
+                keyL.TextColor3 = Color3.fromRGB(120, 220, 120)
+            else
+                keyL.Text = "Skill: NOT equipped (need Charles)"
+                keyL.TextColor3 = Color3.fromRGB(230, 130, 130)
+            end
+
+            local char = LocalPlayer.Character
+            if char then
+                local flags = {}
+                if hasInfoFlag(char, "Stun") then table.insert(flags, "Stun") end
+                if hasInfoFlag(char, "IFrame") then table.insert(flags, "IF") end
+                if hasInfoFlag(char, "Block") then table.insert(flags, "Block") end
+                local rag = char:GetAttribute("Ragdoll")
+                if rag and rag > 0 then table.insert(flags, "Rag") end
+                if #flags > 0 then
+                    stateL.Text = "State: " .. table.concat(flags, " ")
+                    stateL.TextColor3 = Color3.fromRGB(230, 170, 110)
+                else
+                    stateL.Text = "State: clear"
+                    stateL.TextColor3 = Color3.fromRGB(160, 220, 160)
+                end
+            end
+        end)
+        task.wait(0.15)
+    end
+end)
+
+print("[AutoEyeCatching v2] Loaded. Hitsphere:", hitsphereTemplate ~= nil)
