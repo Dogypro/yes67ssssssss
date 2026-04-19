@@ -1,0 +1,257 @@
+local URL = "https://api.jnkie.com/api/v1/luascripts/public/13ad11541abc1f80a6c26d5bde373a8932619755eae33667d9e3d0f5d8311462/download"
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================
+-- GUI
+-- ============================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("SRCVIEW"):Destroy() end)
+
+local guiParent
+local ok1 = pcall(function()
+    local g = Instance.new("ScreenGui")
+    g.Name = "SRCVIEW"
+    g.Parent = game:GetService("CoreGui")
+    guiParent = g
+end)
+if not ok1 then
+    local ok2 = pcall(function()
+        local g = Instance.new("ScreenGui")
+        g.Name = "SRCVIEW"
+        g.Parent = gethui()
+        guiParent = g
+    end)
+    if not ok2 then
+        local g = Instance.new("ScreenGui")
+        g.Name = "SRCVIEW"
+        g.ResetOnSpawn = false
+        g.Parent = LocalPlayer.PlayerGui
+        guiParent = g
+    end
+end
+guiParent.ResetOnSpawn = false
+
+-- main frame
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 600, 0, 420)
+fr.Position = UDim2.new(0.5, -300, 0.5, -210)
+fr.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+fr.BorderSizePixel = 0
+fr.Active = true
+fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+local stroke = Instance.new("UIStroke", fr)
+stroke.Color = Color3.fromRGB(80, 50, 100)
+
+-- drag
+local dragging, dragStart, startPos
+fr.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = true dragStart = i.Position startPos = fr.Position
+        i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+
+-- title
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -80, 0, 30)
+title.Position = UDim2.new(0, 10, 0, 6)
+title.BackgroundTransparency = 1
+title.Text = "SOURCE VIEWER"
+title.TextColor3 = Color3.fromRGB(255, 180, 50)
+title.TextSize = 14
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = fr
+
+-- close
+local closeB = Instance.new("TextButton")
+closeB.Size = UDim2.new(0, 28, 0, 24)
+closeB.Position = UDim2.new(1, -34, 0, 8)
+closeB.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
+closeB.Text = "X"
+closeB.TextColor3 = Color3.fromRGB(230, 230, 230)
+closeB.TextSize = 13
+closeB.Font = Enum.Font.GothamBold
+closeB.Parent = fr
+Instance.new("UICorner", closeB).CornerRadius = UDim.new(0, 4)
+closeB.MouseButton1Click:Connect(function() guiParent:Destroy() end)
+
+-- status label
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 18)
+status.Position = UDim2.new(0, 10, 0, 36)
+status.BackgroundTransparency = 1
+status.Text = "idle"
+status.TextColor3 = Color3.fromRGB(160, 160, 170)
+status.TextSize = 11
+status.Font = Enum.Font.Gotham
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = fr
+
+-- scroll box for source
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, -20, 1, -100)
+scroll.Position = UDim2.new(0, 10, 0, 58)
+scroll.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 6
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Parent = fr
+Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
+
+local srcBox = Instance.new("TextBox")
+srcBox.Size = UDim2.new(1, -10, 0, 0)
+srcBox.Position = UDim2.new(0, 5, 0, 5)
+srcBox.AutomaticSize = Enum.AutomaticSize.Y
+srcBox.BackgroundTransparency = 1
+srcBox.Text = ""
+srcBox.TextColor3 = Color3.fromRGB(220, 220, 230)
+srcBox.TextSize = 11
+srcBox.Font = Enum.Font.Code
+srcBox.TextXAlignment = Enum.TextXAlignment.Left
+srcBox.TextYAlignment = Enum.TextYAlignment.Top
+srcBox.TextWrapped = true
+srcBox.MultiLine = true
+srcBox.ClearTextOnFocus = false
+srcBox.Parent = scroll
+
+-- buttons row
+local fetchB = Instance.new("TextButton")
+fetchB.Size = UDim2.new(0, 120, 0, 28)
+fetchB.Position = UDim2.new(0, 10, 1, -36)
+fetchB.BackgroundColor3 = Color3.fromRGB(40, 80, 50)
+fetchB.Text = "FETCH"
+fetchB.TextColor3 = Color3.fromRGB(230, 230, 230)
+fetchB.TextSize = 13
+fetchB.Font = Enum.Font.GothamBold
+fetchB.Parent = fr
+Instance.new("UICorner", fetchB).CornerRadius = UDim.new(0, 6)
+
+local copyB = Instance.new("TextButton")
+copyB.Size = UDim2.new(0, 120, 0, 28)
+copyB.Position = UDim2.new(0, 140, 1, -36)
+copyB.BackgroundColor3 = Color3.fromRGB(40, 60, 100)
+copyB.Text = "COPY"
+copyB.TextColor3 = Color3.fromRGB(230, 230, 230)
+copyB.TextSize = 13
+copyB.Font = Enum.Font.GothamBold
+copyB.Parent = fr
+Instance.new("UICorner", copyB).CornerRadius = UDim.new(0, 6)
+
+local saveB = Instance.new("TextButton")
+saveB.Size = UDim2.new(0, 120, 0, 28)
+saveB.Position = UDim2.new(0, 270, 1, -36)
+saveB.BackgroundColor3 = Color3.fromRGB(70, 50, 90)
+saveB.Text = "SAVE FILE"
+saveB.TextColor3 = Color3.fromRGB(230, 230, 230)
+saveB.TextSize = 13
+saveB.Font = Enum.Font.GothamBold
+saveB.Parent = fr
+Instance.new("UICorner", saveB).CornerRadius = UDim.new(0, 6)
+
+-- ============================================
+-- FETCH LOGIC (in task.spawn to avoid blocking)
+-- ============================================
+local fetchedSource = nil
+
+local function setStatus(txt, color)
+    status.Text = txt
+    status.TextColor3 = color or Color3.fromRGB(160, 160, 170)
+end
+
+fetchB.MouseButton1Click:Connect(function()
+    setStatus("fetching...", Color3.fromRGB(255, 200, 80))
+    fetchB.AutoButtonColor = false
+    task.spawn(function()
+        local req = request or http_request or (syn and syn.request) or (http and http.request)
+        local source, status_code, err
+
+        if req then
+            local ok, res = pcall(req, {
+                Url = URL,
+                Method = "GET",
+                Headers = {["User-Agent"] = "Roblox/WinInet"}
+            })
+            if ok and res then
+                source = res.Body
+                status_code = res.StatusCode
+            else
+                err = tostring(res)
+            end
+        elseif game.HttpGet then
+            local ok, res = pcall(function() return game:HttpGet(URL) end)
+            if ok then source = res else err = tostring(res) end
+        else
+            err = "no HTTP function available"
+        end
+
+        if not source then
+            setStatus("failed: " .. tostring(err), Color3.fromRGB(230, 80, 80))
+            fetchB.AutoButtonColor = true
+            return
+        end
+
+        fetchedSource = source
+
+        -- If the response is very large, only display a preview in the box
+        -- to avoid UI lag, but keep full source in memory for copy/save
+        local preview = source
+        if #source > 50000 then
+            preview = source:sub(1, 50000) .. "\n\n-- [truncated in view, full source still in COPY/SAVE] --"
+        end
+        srcBox.Text = preview
+
+        setStatus(string.format("ok — status %s, %d chars", tostring(status_code or "?"), #source),
+            Color3.fromRGB(120, 230, 120))
+        fetchB.AutoButtonColor = true
+    end)
+end)
+
+copyB.MouseButton1Click:Connect(function()
+    if not fetchedSource then
+        setStatus("nothing to copy — fetch first", Color3.fromRGB(230, 180, 80))
+        return
+    end
+    local ok = pcall(function()
+        if setclipboard then setclipboard(fetchedSource)
+        elseif toclipboard then toclipboard(fetchedSource)
+        elseif Clipboard and Clipboard.set then Clipboard.set(fetchedSource)
+        else error("no clipboard func") end
+    end)
+    if ok then
+        setStatus("copied to clipboard (" .. #fetchedSource .. " chars)", Color3.fromRGB(120, 230, 120))
+    else
+        setStatus("clipboard not available in this executor", Color3.fromRGB(230, 80, 80))
+    end
+end)
+
+saveB.MouseButton1Click:Connect(function()
+    if not fetchedSource then
+        setStatus("nothing to save — fetch first", Color3.fromRGB(230, 180, 80))
+        return
+    end
+    if not writefile then
+        setStatus("writefile not available", Color3.fromRGB(230, 80, 80))
+        return
+    end
+    local ok, err = pcall(writefile, "fetched_source.lua", fetchedSource)
+    if ok then
+        setStatus("saved to workspace/fetched_source.lua", Color3.fromRGB(120, 230, 120))
+    else
+        setStatus("save failed: " .. tostring(err), Color3.fromRGB(230, 80, 80))
+    end
+end)
+
+setStatus("ready — click FETCH")
