@@ -1,0 +1,18 @@
+task.spawn(function()
+    local url = "https://api.jnkie.com/api/v1/luascripts/public/13ad11541abc1f80a6c26d5bde373a8932619755eae33667d9e3d0f5d8311462/download"
+
+    local req = request or http_request or (syn and syn.request)
+    if not req then warn("no request func") return end
+
+    local ok, res = pcall(req, {Url = url, Method = "GET"})
+    if not ok then warn("request errored:", res) return end
+    if not res then warn("no response") return end
+
+    warn("status:", res.StatusCode)
+    warn("size:", res.Body and #res.Body or 0)
+
+    if res.Body and writefile then
+        local ok2, err = pcall(writefile, "fetched.txt", res.Body)
+        warn("writefile:", ok2, err)
+    end
+end)
