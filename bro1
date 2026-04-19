@@ -1,0 +1,395 @@
+-- ============================================
+-- AUTO DODGE — Jujutsu Shenanigans
+-- Uses real character state attributes from the game's code:
+--   Evade (meter, /50), IFrame, Stun, NoDash, Block, Ragdoll, Dead
+-- Dodge key: Q (same key the game binds DashRequest to)
+-- ============================================
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+
+local DODGE_KEY = 0x51 -- Q
+
+-- ============================================
+-- TUNABLES
+-- ============================================
+local MIN_EVADE          = 12    -- don't dodge if evade meter below this (saves for emergencies)
+local MELEE_RANGE        = 7
+local FACING_DOT         = 0.75  -- attacker must look at us
+local EXTENDED_RANGE     = 14
+local EXTENDED_DOT       = 0.9
+local DODGE_COOLDOWN     = 0.8   -- seconds between dodges
+local PROJ_DANGER_TIME   = 0.2   -- projectile arriving within this many seconds triggers dodge
+
+-- ============================================
+-- STATE
+-- ============================================
+local dodgeOn = false
+local dodges = 0
+local lastDodge = 0
+local lastSelfAttack = 0
+
+-- ============================================
+-- GAME-STATE CHECKS (from the dump)
+-- ============================================
+local function canDodge()
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+
+    -- Real attributes set by the game
+    if char:GetAttribute("Dead") then return false end
+    if char:GetAttribute("Stun") then return false end
+    if char:GetAttribute("NoDash") then return false end
+    if char:GetAttribute("Ragdoll") and char:GetAttribute("Ragdoll") > 0 then return false end
+
+    -- If we're already in IFrame, no reason to burn evade
+    if char:GetAttribute("IFrame") then return false end
+
+    -- Evade meter check (game caps it at 50, uses it for dash/escape)
+    local evade = char:GetAttribute("Evade")
+    if evade ~= nil and evade < MIN_EVADE then return false end
+
+    return true
+end
+
+local function fireDodge(reason)
+    if not dodgeOn then return end
+    if (tick() - lastDodge) < DODGE_COOLDOWN then return end
+    if not canDodge() then return end
+
+    lastDodge = tick()
+    dodges = dodges + 1
+    keypress(DODGE_KEY)
+    task.delay(0.08, function() keyrelease(DODGE_KEY) end)
+end
+
+-- ============================================
+-- SELF-ATTACK TRACKING (ignore our own hitboxes)
+-- ============================================
+UIS.InputBegan:Connect(function(i, gpe)
+    if gpe then return end
+    if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.KeyCode == Enum.KeyCode.F or i.KeyCode == Enum.KeyCode.R
+        or i.KeyCode == Enum.KeyCode.E or i.KeyCode == Enum.KeyCode.Z
+        or i.KeyCode == Enum.KeyCode.X or i.KeyCode == Enum.KeyCode.C
+        or i.KeyCode == Enum.KeyCode.One or i.KeyCode == Enum.KeyCode.Two
+        or i.KeyCode == Enum.KeyCode.Three or i.KeyCode == Enum.KeyCode.Four then
+        lastSelfAttack = tick()
+    end
+end)
+
+local function isMyOwnHitbox(part)
+    if (tick() - lastSelfAttack) < 0.45 then return true end
+    local owner = part:GetAttribute("Owner") or part:GetAttribute("Player") or part:GetAttribute("Caster")
+    if owner == LocalPlayer.Name or owner == LocalPlayer.UserId then return true end
+    return false
+end
+
+-- ============================================
+-- COMBAT ANIM FILTER
+-- ============================================
+local SAFE = {}
+for _, id in {"180435571","180435792","15621270146","7012721719","180436334","9442520397","178130996"} do
+    SAFE[id] = true
+end
+local function isCombatAnim(track)
+    if not track or not track.Animation then return false end
+    local id = track.Animation.AnimationId
+    if not id then return false end
+    local n = id:match("%d+")
+    return n and not SAFE[n]
+end
+
+-- ============================================
+-- TARGETING CHECK (reused from counter v3)
+-- ============================================
+local function isAimedAtMe(theirRoot, myRoot)
+    local delta = myRoot.Position - theirRoot.Position
+    local dist = delta.Magnitude
+    if dist < 0.1 then return false end
+    local toMe = delta.Unit
+    local theirDot = theirRoot.CFrame.LookVector:Dot(toMe)
+
+    if dist <= MELEE_RANGE and theirDot >= FACING_DOT then return true end
+    if dist <= EXTENDED_RANGE and theirDot >= EXTENDED_DOT then return true end
+    return false
+end
+
+-- ============================================
+-- ANIM WATCH
+-- ============================================
+local function watchPlayer(p)
+    if p == LocalPlayer then return end
+    local function onChar(char)
+        pcall(function()
+            local hum = char:WaitForChild("Humanoid", 10)
+            if not hum then return end
+            local animator = hum:WaitForChild("Animator", 5)
+            if not animator then return end
+            animator.AnimationPlayed:Connect(function(animTrack)
+                if not dodgeOn then return end
+                if not isCombatAnim(animTrack) then return end
+
+                local myChar = LocalPlayer.Character
+                if not myChar then return end
+                local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+                local theirRoot = char:FindFirstChild("HumanoidRootPart")
+                if not myRoot or not theirRoot then return end
+
+                if isAimedAtMe(theirRoot, myRoot) then
+                    fireDodge("anim")
+                end
+            end)
+        end)
+    end
+    if p.Character then onChar(p.Character) end
+    p.CharacterAdded:Connect(onChar)
+end
+
+for _, p in Players:GetPlayers() do watchPlayer(p) end
+Players.PlayerAdded:Connect(watchPlayer)
+
+-- ============================================
+-- HITBOX OVERLAP (guaranteed hit)
+-- ============================================
+local processed = setmetatable({}, {__mode = "k"})
+
+local function watchHitbox(part)
+    if processed[part] then return end
+    if not part:IsA("BasePart") then return end
+    processed[part] = true
+
+    task.spawn(function()
+        local start = tick()
+        while part.Parent and (tick() - start) < 0.8 do
+            if dodgeOn then
+                local myChar = LocalPlayer.Character
+                if myChar and not isMyOwnHitbox(part) then
+                    local myHRP = myChar:FindFirstChild("HumanoidRootPart")
+                    if myHRP then
+                        local dist = (part.Position - myHRP.Position).Magnitude
+                        if dist < (part.Size.Magnitude + 10) then
+                            local params = OverlapParams.new()
+                            params.FilterType = Enum.RaycastFilterType.Include
+                            params.FilterDescendantsInstances = {myChar}
+                            params.MaxParts = 1
+                            local hits = workspace:GetPartsInPart(part, params)
+                            if #hits > 0 then
+                                fireDodge("hitbox")
+                                return
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(0.025)
+        end
+    end)
+end
+
+local function monitorContainer(container)
+    if not container then return end
+    for _, c in container:GetChildren() do watchHitbox(c) end
+    container.ChildAdded:Connect(watchHitbox)
+end
+
+monitorContainer(workspace:FindFirstChild("Effects"))
+monitorContainer(workspace:FindFirstChild("Debris"))
+monitorContainer(workspace:FindFirstChild("Hitboxes"))
+workspace.ChildAdded:Connect(function(c)
+    local n = c.Name:lower()
+    if n == "effects" or n == "debris" or n:find("hitbox") then
+        monitorContainer(c)
+    end
+end)
+
+-- ============================================
+-- PROJECTILE PREDICTION
+-- ============================================
+pcall(function()
+    local eff = workspace:FindFirstChild("Effects")
+    if not eff then return end
+    eff.ChildAdded:Connect(function(part)
+        if not dodgeOn or not part:IsA("BasePart") then return end
+        if isMyOwnHitbox(part) then return end
+        task.defer(function()
+            for _ = 1, 15 do
+                if not part.Parent or not dodgeOn then return end
+                pcall(function()
+                    local myChar = LocalPlayer.Character
+                    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+                    if not myRoot then return end
+                    local toMe = myRoot.Position - part.Position
+                    local dist = toMe.Magnitude
+                    local vel = part.AssemblyLinearVelocity
+                    if vel.Magnitude > 15 and dist < 12 then
+                        local aimed = vel.Unit:Dot(toMe.Unit)
+                        local timeToHit = dist / vel.Magnitude
+                        if aimed > 0.75 and timeToHit < PROJ_DANGER_TIME then
+                            fireDodge("projectile")
+                            return
+                        end
+                    end
+                end)
+                task.wait(0.03)
+            end
+        end)
+    end)
+end)
+
+-- ============================================
+-- REACTIVE: if Stun attribute goes true, we already got hit
+-- This lets us dodge OUT of an incoming combo if we still have evade
+-- ============================================
+local function hookCharacter(char)
+    pcall(function()
+        char:GetAttributeChangedSignal("Stun"):Connect(function()
+            if not dodgeOn then return end
+            if char:GetAttribute("Stun") then
+                -- give the stun a tick to settle, then try to escape
+                task.wait(0.05)
+                if canDodge() then fireDodge("escape-stun") end
+            end
+        end)
+    end)
+    pcall(function()
+        char:GetAttributeChangedSignal("Ragdoll"):Connect(function()
+            if not dodgeOn then return end
+            local r = char:GetAttribute("Ragdoll")
+            if r and r > 0 then
+                task.wait(0.1)
+                -- dodge cancels ragdoll per the game's help text
+                if dodgeOn and (tick() - lastDodge) > DODGE_COOLDOWN then
+                    keypress(DODGE_KEY)
+                    task.delay(0.08, function() keyrelease(DODGE_KEY) end)
+                    lastDodge = tick()
+                    dodges = dodges + 1
+                end
+            end
+        end)
+    end)
+end
+hookCharacter(character)
+
+-- ============================================
+-- RESPAWN
+-- ============================================
+LocalPlayer.CharacterAdded:Connect(function(char)
+    character = char
+    task.wait(0.5)
+    hookCharacter(char)
+end)
+
+-- ============================================
+-- GUI
+-- ============================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("ADX"):Destroy() end)
+local guiParent
+local ok1 = pcall(function()
+    local g = Instance.new("ScreenGui")
+    g.Name = "ADX"
+    g.ResetOnSpawn = false
+    g.Parent = game:GetService("CoreGui")
+    guiParent = g
+end)
+if not ok1 then
+    local ok2 = pcall(function()
+        local g = Instance.new("ScreenGui")
+        g.Name = "ADX"
+        g.ResetOnSpawn = false
+        g.Parent = gethui()
+        guiParent = g
+    end)
+    if not ok2 then
+        local g = Instance.new("ScreenGui")
+        g.Name = "ADX"
+        g.ResetOnSpawn = false
+        g.Parent = LocalPlayer.PlayerGui
+        guiParent = g
+    end
+end
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 160, 0, 75)
+fr.Position = UDim2.new(1, -170, 0, 80)
+fr.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", fr).Color = Color3.fromRGB(50, 90, 130)
+
+local dragging, dragStart, startPos
+fr.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = true dragStart = i.Position startPos = fr.Position
+        i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+
+local titleL = Instance.new("TextLabel")
+titleL.Size = UDim2.new(0.55, 0, 0, 12) titleL.Position = UDim2.new(0, 8, 0, 4)
+titleL.BackgroundTransparency = 1 titleL.Text = "AUTO DODGE"
+titleL.TextColor3 = Color3.fromRGB(80, 160, 255)
+titleL.TextSize = 10 titleL.Font = Enum.Font.GothamBold
+titleL.TextXAlignment = Enum.TextXAlignment.Left titleL.Parent = fr
+
+local countL = Instance.new("TextLabel")
+countL.Size = UDim2.new(0.45, -8, 0, 12) countL.Position = UDim2.new(0.55, 0, 0, 4)
+countL.BackgroundTransparency = 1 countL.Text = "0"
+countL.TextColor3 = Color3.fromRGB(140, 140, 150)
+countL.TextSize = 10 countL.Font = Enum.Font.Gotham
+countL.TextXAlignment = Enum.TextXAlignment.Right countL.Parent = fr
+
+local evadeL = Instance.new("TextLabel")
+evadeL.Size = UDim2.new(1, -16, 0, 12) evadeL.Position = UDim2.new(0, 8, 0, 18)
+evadeL.BackgroundTransparency = 1 evadeL.Text = "Evade: --"
+evadeL.TextColor3 = Color3.fromRGB(120, 200, 120)
+evadeL.TextSize = 10 evadeL.Font = Enum.Font.Gotham
+evadeL.TextXAlignment = Enum.TextXAlignment.Left evadeL.Parent = fr
+
+local toggleB = Instance.new("TextButton")
+toggleB.Size = UDim2.new(1, -14, 0, 26) toggleB.Position = UDim2.new(0, 7, 0, 36)
+toggleB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) toggleB.Text = "OFF"
+toggleB.TextColor3 = Color3.fromRGB(200, 200, 210) toggleB.TextSize = 13 toggleB.Font = Enum.Font.GothamBold
+toggleB.Parent = fr Instance.new("UICorner", toggleB).CornerRadius = UDim.new(0, 6)
+toggleB.MouseButton1Click:Connect(function()
+    dodgeOn = not dodgeOn
+    toggleB.Text = dodgeOn and "ON" or "OFF"
+    toggleB.BackgroundColor3 = dodgeOn and Color3.fromRGB(40, 90, 160) or Color3.fromRGB(35, 35, 45)
+end)
+
+-- Status updater (shows current evade meter)
+task.spawn(function()
+    while true do
+        pcall(function()
+            countL.Text = tostring(dodges)
+            local char = LocalPlayer.Character
+            if char then
+                local ev = char:GetAttribute("Evade")
+                if ev ~= nil then
+                    evadeL.Text = string.format("Evade: %d/50", math.floor(ev))
+                    if ev < MIN_EVADE then
+                        evadeL.TextColor3 = Color3.fromRGB(230, 130, 130)
+                    else
+                        evadeL.TextColor3 = Color3.fromRGB(120, 200, 120)
+                    end
+                else
+                    evadeL.Text = "Evade: --"
+                end
+            end
+        end)
+        task.wait(0.2)
+    end
+end)
+
+print("[AutoDodge] Loaded. Key: Q (0x51). Min evade: " .. MIN_EVADE)
