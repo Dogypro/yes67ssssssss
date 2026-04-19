@@ -1,0 +1,189 @@
+-- LocalScript
+local Players = game:GetService("Players")
+local LogService = game:GetService("LogService")
+local UIS = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Clean up old instance
+pcall(function() playerGui:FindFirstChild("LiveConsoleUI"):Destroy() end)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "LiveConsoleUI"
+gui.ResetOnSpawn = false
+gui.Parent = playerGui
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 600, 0, 380)
+main.Position = UDim2.new(0.5, -300, 0.5, -190)
+main.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 0, 32)
+title.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+title.BorderSizePixel = 0
+title.Text = "Console"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 18
+title.Font = Enum.Font.SourceSansSemibold
+title.Parent = main
+
+-- Title bar background that extends across (so drag area matches close button row)
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 32)
+titleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+titleBar.BorderSizePixel = 0
+titleBar.ZIndex = 0
+titleBar.Parent = main
+
+-- Close button
+local closeButton = Instance.new("TextButton")
+closeButton.Size = UDim2.new(0, 32, 0, 32)
+closeButton.Position = UDim2.new(1, -32, 0, 0)
+closeButton.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
+closeButton.BorderSizePixel = 0
+closeButton.Text = "X"
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.TextSize = 16
+closeButton.Font = Enum.Font.SourceSansBold
+closeButton.Parent = main
+
+closeButton.MouseButton1Click:Connect(function()
+    gui:Destroy()
+end)
+
+local output = Instance.new("TextBox")
+output.Size = UDim2.new(1, -20, 1, -80)
+output.Position = UDim2.new(0, 10, 0, 42)
+output.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+output.BorderSizePixel = 0
+output.TextColor3 = Color3.fromRGB(230, 230, 230)
+output.TextSize = 16
+output.Font = Enum.Font.Code
+output.TextXAlignment = Enum.TextXAlignment.Left
+output.TextYAlignment = Enum.TextYAlignment.Top
+output.ClearTextOnFocus = false
+output.MultiLine = true
+output.TextWrapped = false
+output.TextEditable = false
+output.RichText = false
+output.Text = ""
+output.Parent = main
+
+local copyButton = Instance.new("TextButton")
+copyButton.Size = UDim2.new(0, 110, 0, 28)
+copyButton.Position = UDim2.new(1, -120, 1, -34)
+copyButton.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+copyButton.BorderSizePixel = 0
+copyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+copyButton.TextSize = 16
+copyButton.Font = Enum.Font.SourceSansSemibold
+copyButton.Text = "Copy"
+copyButton.Parent = main
+
+local clearButton = Instance.new("TextButton")
+clearButton.Size = UDim2.new(0, 90, 0, 28)
+clearButton.Position = UDim2.new(1, -215, 1, -34)
+clearButton.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+clearButton.BorderSizePixel = 0
+clearButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+clearButton.TextSize = 16
+clearButton.Font = Enum.Font.SourceSansSemibold
+clearButton.Text = "Clear"
+clearButton.Parent = main
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -230, 0, 28)
+status.Position = UDim2.new(0, 10, 1, -34)
+status.BackgroundTransparency = 1
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextColor3 = Color3.fromRGB(180, 180, 180)
+status.TextSize = 14
+status.Font = Enum.Font.SourceSans
+status.Text = ""
+status.Parent = main
+
+local lines = {}
+local function rebuildText()
+    output.Text = table.concat(lines, "\n")
+    output.CursorPosition = #output.Text + 1
+end
+
+local function addLine(messageType, message)
+    local prefix = "[" .. tostring(messageType) .. "] "
+    table.insert(lines, prefix .. message)
+    if #lines > 300 then
+        table.remove(lines, 1)
+    end
+    rebuildText()
+end
+
+LogService.MessageOut:Connect(function(message, messageType)
+    addLine(messageType.Name, message)
+end)
+
+copyButton.MouseButton1Click:Connect(function()
+    local text = output.Text
+    if typeof(setclipboard) == "function" then
+        pcall(function() setclipboard(text) end)
+        status.Text = "Copied to clipboard."
+    else
+        output:CaptureFocus()
+        output.SelectionStart = 1
+        output.CursorPosition = #text + 1
+        status.Text = "Clipboard is unavailable here. Text is selected."
+    end
+    task.delay(2, function() status.Text = "" end)
+end)
+
+clearButton.MouseButton1Click:Connect(function()
+    lines = {}
+    rebuildText()
+    status.Text = "Cleared."
+    task.delay(2, function() status.Text = "" end)
+end)
+
+-- ============================================
+-- DRAG — attached to title bar only (so textbox still works)
+-- ============================================
+local dragging = false
+local dragStart, startPos
+
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+UIS.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
