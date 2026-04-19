@@ -1,0 +1,20 @@
+task.spawn(function()
+    local url = "https://api.jnkie.com/api/v1/luascripts/public/13ad11541abc1f80a6c26d5bde373a8932619755eae33667d9e3d0f5d8311462/download"
+    local req = request or http_request or (syn and syn.request)
+    if not req then warn("no request") return end
+
+    local ok, res = pcall(req, {
+        Url = url,
+        Method = "GET",
+        Headers = {["User-Agent"] = "Roblox/WinInet"}
+    })
+    warn("pcall ok:", ok)
+    if not ok then warn("err:", tostring(res)) return end
+    warn("status:", res and res.StatusCode)
+    warn("size:", res and res.Body and #res.Body)
+    -- don't touch the body beyond length, just write
+    if res and res.Body then
+        pcall(writefile, "dl.txt", res.Body)
+        warn("written")
+    end
+end)
