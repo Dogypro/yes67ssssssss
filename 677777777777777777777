@@ -1,0 +1,591 @@
+-- ============================================
+-- SCRIPT SCANNER + MINI AI SUMMARIZER
+-- Scans all readable scripts in the game and summarizes what matters
+-- ============================================
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================
+-- CONFIG — optional: set an OpenAI-compatible endpoint + key
+-- Leave AI_ENABLED = false to use heuristic summarizer only (no network)
+-- ============================================
+local AI_ENABLED  = false
+local AI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+local AI_KEY      = "" -- put your key here if you enable AI
+local AI_MODEL    = "gpt-4o-mini"
+
+-- ============================================
+-- SCRIPT COLLECTION
+-- We scan containers a LocalScript can realistically read from.
+-- Server Scripts' .Source is not readable from the client in live games;
+-- this script surfaces whatever IS readable (ModuleScripts, LocalScripts).
+-- ============================================
+local SCAN_ROOTS = {
+    game:GetService("ReplicatedStorage"),
+    game:GetService("ReplicatedFirst"),
+    game:GetService("StarterPlayer"),
+    game:GetService("StarterGui"),
+    game:GetService("StarterPack"),
+    game:GetService("Lighting"),
+    game:GetService("Workspace"),
+    LocalPlayer:FindFirstChild("PlayerGui"),
+    LocalPlayer:FindFirstChild("PlayerScripts"),
+    LocalPlayer.Character,
+}
+
+local function collectScripts()
+    local found = {}
+    local seen = {}
+    for _, root in SCAN_ROOTS do
+        if root then
+            for _, inst in root:GetDescendants() do
+                if (inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script"))
+                    and not seen[inst] then
+                    seen[inst] = true
+                    table.insert(found, inst)
+                end
+            end
+        end
+    end
+    return found
+end
+
+local function tryReadSource(script)
+    local ok, src = pcall(function() return script.Source end)
+    if ok and type(src) == "string" and #src > 0 then
+        return src
+    end
+    -- decompile fallback (available in executor environments)
+    if decompile then
+        local ok2, src2 = pcall(decompile, script)
+        if ok2 and type(src2) == "string" and #src2 > 0 then
+            return src2
+        end
+    end
+    return nil
+end
+
+-- ============================================
+-- HEURISTIC SUMMARIZER
+-- Pulls out structural signals: services used, remotes, keybinds, functions, etc.
+-- ============================================
+local function summarizeHeuristic(source, name)
+    local lines = {}
+    local function add(s) table.insert(lines, s) end
+
+    local loc = select(2, source:gsub("\n", "\n")) + 1
+
+    -- services
+    local services = {}
+    for svc in source:gmatch('GetService%(%s*"([%w_]+)"') do services[svc] = true end
+    local svcList = {}
+    for s in pairs(services) do table.insert(svcList, s) end
+    table.sort(svcList)
+
+    -- remotes
+    local remotes = {}
+    for pattern in source:gmatch('([%w_]+):FireServer') do remotes[pattern .. ":FireServer"] = true end
+    for pattern in source:gmatch('([%w_]+):InvokeServer') do remotes[pattern .. ":InvokeServer"] = true end
+    for pattern in source:gmatch('([%w_]+)%.OnClientEvent') do remotes[pattern .. ".OnClientEvent"] = true end
+
+    -- keybinds / input
+    local keys = {}
+    for k in source:gmatch('KeyCode%.([%w_]+)') do keys[k] = true end
+
+    -- functions defined
+    local funcs = {}
+    for f in source:gmatch('function%s+([%w_:%.]+)%s*%(') do table.insert(funcs, f) end
+    for f in source:gmatch('local%s+function%s+([%w_]+)%s*%(') do table.insert(funcs, f) end
+
+    -- interesting flags
+    local flags = {}
+    if source:find("HttpGet") or source:find("HttpPost") or source:find("request%s*%(") then
+        table.insert(flags, "makes HTTP requests")
+    end
+    if source:find("loadstring") then table.insert(flags, "uses loadstring") end
+    if source:find("RunService") and (source:find("RenderStepped") or source:find("Heartbeat") or source:find("Stepped")) then
+        table.insert(flags, "runs every frame")
+    end
+    if source:find("UserInputService") or source:find("ContextActionService") then
+        table.insert(flags, "handles input")
+    end
+    if source:find("TweenService") then table.insert(flags, "uses tweens") end
+    if source:find("workspace:Raycast") or source:find("FindPartOnRay") then
+        table.insert(flags, "raycasts")
+    end
+    if source:find("Instance%.new%(%s*\"ScreenGui\"") or source:find(":WaitForChild%(\"PlayerGui\"") then
+        table.insert(flags, "creates GUI")
+    end
+    if source:find("BodyVelocity") or source:find("LinearVelocity") or source:find("AlignPosition") then
+        table.insert(flags, "manipulates physics/movement")
+    end
+    if source:find("Humanoid") and (source:find(":Move%(") or source:find("%.WalkSpeed") or source:find("%.JumpPower")) then
+        table.insert(flags, "controls Humanoid")
+    end
+
+    -- comments at top (often explain intent)
+    local firstComments = {}
+    for line in source:gmatch("[^\n]+") do
+        local stripped = line:match("^%s*(.-)%s*$")
+        if stripped:sub(1, 2) == "--" then
+            table.insert(firstComments, stripped)
+            if #firstComments >= 3 then break end
+        elseif stripped ~= "" then
+            break
+        end
+    end
+
+    -- assemble
+    add("• Lines: " .. loc)
+    if #firstComments > 0 then
+        add("• Header comments: " .. table.concat(firstComments, " | "):sub(1, 200))
+    end
+    if #svcList > 0 then
+        add("• Services: " .. table.concat(svcList, ", "))
+    end
+    local remoteList = {}
+    for r in pairs(remotes) do table.insert(remoteList, r) end
+    if #remoteList > 0 then
+        table.sort(remoteList)
+        add("• Remotes: " .. table.concat(remoteList, ", "):sub(1, 300))
+    end
+    local keyList = {}
+    for k in pairs(keys) do table.insert(keyList, k) end
+    if #keyList > 0 then
+        table.sort(keyList)
+        add("• Keybinds: " .. table.concat(keyList, ", "))
+    end
+    if #funcs > 0 then
+        local shown = {}
+        for i = 1, math.min(8, #funcs) do table.insert(shown, funcs[i]) end
+        add("• Functions (" .. #funcs .. "): " .. table.concat(shown, ", "))
+    end
+    if #flags > 0 then
+        add("• Behavior: " .. table.concat(flags, "; "))
+    end
+
+    return table.concat(lines, "\n")
+end
+
+-- ============================================
+-- OPTIONAL AI SUMMARIZER (OpenAI-compatible)
+-- ============================================
+local function summarizeAI(source, name)
+    if not AI_ENABLED or AI_KEY == "" then return nil end
+    local req = request or http_request or (syn and syn.request)
+    if not req then return nil end
+
+    -- truncate massive files to keep token cost down
+    local snippet = source
+    if #snippet > 8000 then
+        snippet = snippet:sub(1, 6000) .. "\n\n-- [truncated] --\n\n" .. snippet:sub(-1500)
+    end
+
+    local body = HttpService:JSONEncode({
+        model = AI_MODEL,
+        messages = {
+            { role = "system", content = "You are summarizing Roblox Luau scripts. Give a 2-4 sentence summary focused on: what the script does, what it interacts with (remotes, services, input), and anything notable about its behavior. Be concise." },
+            { role = "user", content = "Script name: " .. name .. "\n\n" .. snippet }
+        },
+        max_tokens = 200,
+        temperature = 0.3,
+    })
+
+    local ok, res = pcall(req, {
+        Url = AI_ENDPOINT,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. AI_KEY,
+        },
+        Body = body,
+    })
+    if not ok or not res or not res.Body then return nil end
+    local ok2, parsed = pcall(function() return HttpService:JSONDecode(res.Body) end)
+    if not ok2 or not parsed or not parsed.choices then return nil end
+    return parsed.choices[1] and parsed.choices[1].message and parsed.choices[1].message.content
+end
+
+-- ============================================
+-- GUI
+-- ============================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("ScriptScanner"):Destroy() end)
+pcall(function() LocalPlayer.PlayerGui:FindFirstChild("ScriptScanner"):Destroy() end)
+
+local guiParent
+local ok1 = pcall(function()
+    local g = Instance.new("ScreenGui")
+    g.Name = "ScriptScanner"
+    g.ResetOnSpawn = false
+    g.Parent = game:GetService("CoreGui")
+    guiParent = g
+end)
+if not ok1 then
+    local g = Instance.new("ScreenGui")
+    g.Name = "ScriptScanner"
+    g.ResetOnSpawn = false
+    g.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    guiParent = g
+end
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 780, 0, 480)
+main.Position = UDim2.new(0.5, -390, 0.5, -240)
+main.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = guiParent
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 34)
+titleBar.BackgroundColor3 = Color3.fromRGB(28, 28, 38)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 8)
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, -80, 1, 0)
+titleLabel.Position = UDim2.new(0, 12, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "Script Scanner + Summarizer"
+titleLabel.TextColor3 = Color3.fromRGB(255, 180, 60)
+titleLabel.TextSize = 15
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 30, 0, 26)
+closeBtn.Position = UDim2.new(1, -38, 0, 4)
+closeBtn.BackgroundColor3 = Color3.fromRGB(90, 35, 35)
+closeBtn.Text = "X"
+closeBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 13
+closeBtn.BorderSizePixel = 0
+closeBtn.Parent = main
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 5)
+closeBtn.MouseButton1Click:Connect(function() guiParent:Destroy() end)
+
+-- Left panel: script list
+local leftPanel = Instance.new("Frame")
+leftPanel.Size = UDim2.new(0, 280, 1, -80)
+leftPanel.Position = UDim2.new(0, 10, 0, 44)
+leftPanel.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+leftPanel.BorderSizePixel = 0
+leftPanel.Parent = main
+Instance.new("UICorner", leftPanel).CornerRadius = UDim.new(0, 6)
+
+local searchBox = Instance.new("TextBox")
+searchBox.Size = UDim2.new(1, -10, 0, 26)
+searchBox.Position = UDim2.new(0, 5, 0, 5)
+searchBox.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+searchBox.Text = ""
+searchBox.PlaceholderText = "Filter scripts..."
+searchBox.TextColor3 = Color3.fromRGB(220, 220, 230)
+searchBox.PlaceholderColor3 = Color3.fromRGB(110, 110, 120)
+searchBox.Font = Enum.Font.Gotham
+searchBox.TextSize = 12
+searchBox.TextXAlignment = Enum.TextXAlignment.Left
+searchBox.BorderSizePixel = 0
+searchBox.ClearTextOnFocus = false
+searchBox.Parent = leftPanel
+Instance.new("UICorner", searchBox).CornerRadius = UDim.new(0, 4)
+local pad = Instance.new("UIPadding", searchBox)
+pad.PaddingLeft = UDim.new(0, 8)
+
+local scriptList = Instance.new("ScrollingFrame")
+scriptList.Size = UDim2.new(1, -10, 1, -40)
+scriptList.Position = UDim2.new(0, 5, 0, 36)
+scriptList.BackgroundTransparency = 1
+scriptList.BorderSizePixel = 0
+scriptList.ScrollBarThickness = 5
+scriptList.CanvasSize = UDim2.new(0, 0, 0, 0)
+scriptList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scriptList.Parent = leftPanel
+local listLayout = Instance.new("UIListLayout", scriptList)
+listLayout.Padding = UDim.new(0, 2)
+
+-- Right panel: summary
+local rightPanel = Instance.new("Frame")
+rightPanel.Size = UDim2.new(1, -310, 1, -80)
+rightPanel.Position = UDim2.new(0, 300, 0, 44)
+rightPanel.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+rightPanel.BorderSizePixel = 0
+rightPanel.Parent = main
+Instance.new("UICorner", rightPanel).CornerRadius = UDim.new(0, 6)
+
+local summaryHeader = Instance.new("TextLabel")
+summaryHeader.Size = UDim2.new(1, -20, 0, 22)
+summaryHeader.Position = UDim2.new(0, 10, 0, 6)
+summaryHeader.BackgroundTransparency = 1
+summaryHeader.Text = "Select a script to summarize"
+summaryHeader.TextColor3 = Color3.fromRGB(255, 180, 60)
+summaryHeader.Font = Enum.Font.GothamBold
+summaryHeader.TextSize = 13
+summaryHeader.TextXAlignment = Enum.TextXAlignment.Left
+summaryHeader.Parent = rightPanel
+
+local summaryScroll = Instance.new("ScrollingFrame")
+summaryScroll.Size = UDim2.new(1, -20, 1, -40)
+summaryScroll.Position = UDim2.new(0, 10, 0, 32)
+summaryScroll.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+summaryScroll.BorderSizePixel = 0
+summaryScroll.ScrollBarThickness = 5
+summaryScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+summaryScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+summaryScroll.Parent = rightPanel
+Instance.new("UICorner", summaryScroll).CornerRadius = UDim.new(0, 4)
+
+local summaryLabel = Instance.new("TextLabel")
+summaryLabel.Size = UDim2.new(1, -16, 0, 0)
+summaryLabel.Position = UDim2.new(0, 8, 0, 8)
+summaryLabel.AutomaticSize = Enum.AutomaticSize.Y
+summaryLabel.BackgroundTransparency = 1
+summaryLabel.Text = ""
+summaryLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
+summaryLabel.Font = Enum.Font.Code
+summaryLabel.TextSize = 12
+summaryLabel.TextXAlignment = Enum.TextXAlignment.Left
+summaryLabel.TextYAlignment = Enum.TextYAlignment.Top
+summaryLabel.TextWrapped = true
+summaryLabel.Parent = summaryScroll
+
+-- Bottom bar
+local scanBtn = Instance.new("TextButton")
+scanBtn.Size = UDim2.new(0, 120, 0, 28)
+scanBtn.Position = UDim2.new(0, 10, 1, -34)
+scanBtn.BackgroundColor3 = Color3.fromRGB(40, 85, 50)
+scanBtn.Text = "Scan Game"
+scanBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
+scanBtn.Font = Enum.Font.GothamBold
+scanBtn.TextSize = 13
+scanBtn.BorderSizePixel = 0
+scanBtn.Parent = main
+Instance.new("UICorner", scanBtn).CornerRadius = UDim.new(0, 5)
+
+local summarizeAllBtn = Instance.new("TextButton")
+summarizeAllBtn.Size = UDim2.new(0, 140, 0, 28)
+summarizeAllBtn.Position = UDim2.new(0, 140, 1, -34)
+summarizeAllBtn.BackgroundColor3 = Color3.fromRGB(60, 50, 110)
+summarizeAllBtn.Text = "Summarize All"
+summarizeAllBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
+summarizeAllBtn.Font = Enum.Font.GothamBold
+summarizeAllBtn.TextSize = 13
+summarizeAllBtn.BorderSizePixel = 0
+summarizeAllBtn.Parent = main
+Instance.new("UICorner", summarizeAllBtn).CornerRadius = UDim.new(0, 5)
+
+local copyBtn = Instance.new("TextButton")
+copyBtn.Size = UDim2.new(0, 100, 0, 28)
+copyBtn.Position = UDim2.new(0, 290, 1, -34)
+copyBtn.BackgroundColor3 = Color3.fromRGB(50, 60, 95)
+copyBtn.Text = "Copy"
+copyBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
+copyBtn.Font = Enum.Font.GothamBold
+copyBtn.TextSize = 13
+copyBtn.BorderSizePixel = 0
+copyBtn.Parent = main
+Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 5)
+
+local saveBtn = Instance.new("TextButton")
+saveBtn.Size = UDim2.new(0, 100, 0, 28)
+saveBtn.Position = UDim2.new(0, 400, 1, -34)
+saveBtn.BackgroundColor3 = Color3.fromRGB(90, 65, 40)
+saveBtn.Text = "Save File"
+saveBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
+saveBtn.Font = Enum.Font.GothamBold
+saveBtn.TextSize = 13
+saveBtn.BorderSizePixel = 0
+saveBtn.Parent = main
+Instance.new("UICorner", saveBtn).CornerRadius = UDim.new(0, 5)
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -520, 0, 28)
+statusLabel.Position = UDim2.new(0, 510, 1, -34)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Ready."
+statusLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 12
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = main
+
+-- drag
+local dragging, dragStart, startPos
+local function beginDrag(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end
+titleBar.InputBegan:Connect(beginDrag)
+titleLabel.InputBegan:Connect(beginDrag)
+UIS.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+
+-- ============================================
+-- STATE + ACTIONS
+-- ============================================
+local scannedScripts = {}
+local currentSummary = ""
+local allSummaries = ""
+
+local function setStatus(txt, color)
+    statusLabel.Text = txt
+    statusLabel.TextColor3 = color or Color3.fromRGB(160, 160, 170)
+end
+
+local function getScriptPath(inst)
+    local parts = {}
+    local cur = inst
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    return table.concat(parts, ".")
+end
+
+local function rebuildList(filter)
+    for _, c in scriptList:GetChildren() do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    filter = (filter or ""):lower()
+    for i, s in scannedScripts do
+        local path = getScriptPath(s)
+        if filter == "" or path:lower():find(filter, 1, true) then
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, -4, 0, 24)
+            btn.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+            btn.Text = "  " .. s.ClassName:sub(1, 1) .. " | " .. s.Name
+            btn.TextColor3 = Color3.fromRGB(220, 220, 230)
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 11
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.BorderSizePixel = 0
+            btn.Parent = scriptList
+            Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 3)
+            btn.MouseButton1Click:Connect(function()
+                setStatus("Summarizing: " .. s.Name)
+                summaryHeader.Text = path
+                local src = tryReadSource(s)
+                if not src then
+                    currentSummary = "Source not readable (likely a server Script with protected source)."
+                    summaryLabel.Text = currentSummary
+                    setStatus("No readable source for " .. s.Name, Color3.fromRGB(230, 150, 80))
+                    return
+                end
+                local heur = summarizeHeuristic(src, s.Name)
+                currentSummary = heur
+                summaryLabel.Text = heur .. "\n\n-- Preview (first 1000 chars) --\n" .. src:sub(1, 1000)
+                setStatus("Summarized " .. s.Name, Color3.fromRGB(120, 220, 120))
+
+                if AI_ENABLED then
+                    task.spawn(function()
+                        local ai = summarizeAI(src, s.Name)
+                        if ai then
+                            currentSummary = "AI Summary:\n" .. ai .. "\n\nSignals:\n" .. heur
+                            summaryLabel.Text = currentSummary .. "\n\n-- Preview --\n" .. src:sub(1, 1000)
+                        end
+                    end)
+                end
+            end)
+        end
+    end
+end
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    rebuildList(searchBox.Text)
+end)
+
+scanBtn.MouseButton1Click:Connect(function()
+    setStatus("Scanning...")
+    task.spawn(function()
+        scannedScripts = collectScripts()
+        rebuildList(searchBox.Text)
+        setStatus("Found " .. #scannedScripts .. " scripts.", Color3.fromRGB(120, 220, 120))
+    end)
+end)
+
+summarizeAllBtn.MouseButton1Click:Connect(function()
+    if #scannedScripts == 0 then
+        setStatus("Scan first.", Color3.fromRGB(230, 150, 80))
+        return
+    end
+    setStatus("Summarizing all " .. #scannedScripts .. "...")
+    task.spawn(function()
+        local out = {}
+        for i, s in scannedScripts do
+            local src = tryReadSource(s)
+            local path = getScriptPath(s)
+            table.insert(out, "=== " .. path .. " (" .. s.ClassName .. ") ===")
+            if src then
+                table.insert(out, summarizeHeuristic(src, s.Name))
+            else
+                table.insert(out, "  [no readable source]")
+            end
+            table.insert(out, "")
+            if i % 20 == 0 then
+                setStatus("Summarizing... " .. i .. "/" .. #scannedScripts)
+                task.wait()
+            end
+        end
+        allSummaries = table.concat(out, "\n")
+        currentSummary = allSummaries
+        summaryHeader.Text = "All scripts (" .. #scannedScripts .. ")"
+        -- Display truncated, full content still in currentSummary for copy/save
+        local display = allSummaries
+        if #display > 60000 then
+            display = display:sub(1, 60000) .. "\n\n-- [truncated in view, full content in Copy/Save] --"
+        end
+        summaryLabel.Text = display
+        setStatus("Done. " .. #scannedScripts .. " scripts summarized.", Color3.fromRGB(120, 220, 120))
+    end)
+end)
+
+copyBtn.MouseButton1Click:Connect(function()
+    if currentSummary == "" then setStatus("Nothing to copy.", Color3.fromRGB(230, 150, 80)) return end
+    local ok = pcall(function()
+        if setclipboard then setclipboard(currentSummary)
+        elseif toclipboard then toclipboard(currentSummary)
+        else error("no clipboard fn") end
+    end)
+    if ok then
+        setStatus("Copied " .. #currentSummary .. " chars.", Color3.fromRGB(120, 220, 120))
+    else
+        setStatus("Clipboard unavailable — use Save File.", Color3.fromRGB(230, 150, 80))
+    end
+end)
+
+saveBtn.MouseButton1Click:Connect(function()
+    if currentSummary == "" then setStatus("Nothing to save.", Color3.fromRGB(230, 150, 80)) return end
+    if not writefile then setStatus("writefile unavailable.", Color3.fromRGB(230, 80, 80)) return end
+    local fname = "script_summary.txt"
+    local ok, err = pcall(writefile, fname, currentSummary)
+    if ok then
+        setStatus("Saved to workspace/" .. fname, Color3.fromRGB(120, 220, 120))
+    else
+        setStatus("Save failed: " .. tostring(err), Color3.fromRGB(230, 80, 80))
+    end
+end)
+
+-- initial scan
+task.spawn(function()
+    scannedScripts = collectScripts()
+    rebuildList("")
+    setStatus("Initial scan: " .. #scannedScripts .. " scripts.")
+end)
+
+print("[ScriptScanner] Loaded. AI_ENABLED =", AI_ENABLED)
