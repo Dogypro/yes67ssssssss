@@ -1,0 +1,434 @@
+-- ============================================
+-- AUTO EYE CATCHING v4 — PURE REACTIVE
+-- NO animation detection. NO prediction. NO range checks.
+-- Fires the instant ANY damage signal hits us.
+--
+-- Signals monitored (each fires EC immediately with no cooldown between them):
+--   S1: character.Info child added (any state flag)
+--   S2: Humanoid.HealthChanged (HP drop)
+--   S3: Humanoid.StateChanged (ragdoll/physics transition)
+--   S4: character attribute changed (Ragdoll/Stun/etc)
+--   S5: HumanoidRootPart AssemblyLinearVelocity spike (knockback physics)
+--   S6: Any Knit RE with our char as argument
+--
+-- Fire path: direct Knit service call for lowest possible latency.
+-- Debug mode logs every signal with timestamp so you can see what's earliest.
+-- ============================================
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================
+-- CONFIG
+-- ============================================
+local DEBUG = true              -- print every signal to console (turn off later)
+local MIN_REFIRE = 0.12         -- prevent double-firing on same hit (single packet burst)
+local VELOCITY_SPIKE = 40       -- studs/sec of sudden velocity = knockback
+local HEALTH_DROP_MIN = 0.5     -- minimum HP drop to count as damage
+
+-- ============================================
+-- STATE
+-- ============================================
+local ecOn = false
+local fires = 0
+local lastFire = 0
+local lastReason = "-"
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+
+-- ============================================
+-- KNIT
+-- ============================================
+local Knit, ecService
+pcall(function() Knit = require(RS:WaitForChild("Knit"):WaitForChild("Knit")) end)
+
+local function getEcService()
+    if ecService then return ecService end
+    if not Knit then return nil end
+    local ok, svc = pcall(function() return Knit.GetService("EyeCatchService") end)
+    if ok and svc then ecService = svc return svc end
+    return nil
+end
+
+-- ============================================
+-- SKILL LOOKUP
+-- ============================================
+local cachedSkill, cachedKey = nil, nil
+local function findEC()
+    local char = LocalPlayer.Character
+    if not char then return nil, nil end
+    if cachedSkill and cachedSkill.Parent then return cachedSkill, cachedKey end
+    local moveset = char:FindFirstChild("Moveset")
+    if not moveset then return nil, nil end
+    for _, skill in moveset:GetChildren() do
+        local n = skill.Name:lower():gsub("%s", "")
+        if n == "eyecatching" or n == "eyecatch" then
+            local k = skill:GetAttribute("Key")
+            local kc = 0x33
+            if k == 1 then kc = 0x31
+            elseif k == 2 then kc = 0x32
+            elseif k == 3 then kc = 0x33
+            elseif k == 4 then kc = 0x34 end
+            cachedSkill, cachedKey = skill, kc
+            return skill, kc
+        end
+    end
+    return nil, nil
+end
+
+-- ============================================
+-- DEBUG LOG
+-- ============================================
+local startT = tick()
+local function dbg(signal, extra)
+    if not DEBUG then return end
+    local t = string.format("[%.3f]", tick() - startT)
+    print("EC-DEBUG", t, signal, extra or "")
+end
+
+-- ============================================
+-- FIRE — fastest possible path
+-- ============================================
+local function fireEC(reason)
+    if not ecOn then return end
+    if (tick() - lastFire) < MIN_REFIRE then
+        dbg("skipped-refire", reason)
+        return
+    end
+
+    local skill, key = findEC()
+    if not skill or not key then
+        dbg("skipped-noskill", reason)
+        return
+    end
+
+    lastFire = tick()
+    fires = fires + 1
+    lastReason = reason
+    dbg("FIRE", reason)
+
+    -- Path 1: direct Knit fire (fastest)
+    local svc = getEcService()
+    if svc and svc.Activated then
+        pcall(function() svc.Activated:Fire(skill, false) end)
+    end
+
+    -- Path 2: keypress + click (redundancy)
+    pcall(function()
+        keypress(key)
+        task.delay(0.015, function()
+            pcall(function()
+                if mouse1click then mouse1click()
+                elseif mouse1press and mouse1release then
+                    mouse1press() task.wait(0.012) mouse1release()
+                end
+            end)
+        end)
+        task.delay(0.08, function() pcall(keyrelease, key) end)
+    end)
+end
+
+-- ============================================
+-- S1: character.Info.ChildAdded
+-- ============================================
+local INFO_FLAGS = {
+    Stun=true, Block=true, Knockback=true, Ragdoll=true,
+    NoM1=true, NoDash=true, NoJump=true, NoSprint=true,
+    DirectionLock=true, InSkill=true, ForceEsc=true,
+    IFrame=false, -- skip — that's OUR counter activating
+}
+
+local function hookInfo(char)
+    task.spawn(function()
+        local info
+        for _ = 1, 100 do
+            info = char:FindFirstChild("Info")
+            if info then break end
+            task.wait(0.03)
+        end
+        if not info then dbg("NO-INFO-FOLDER") return end
+        dbg("INFO-HOOKED", "children:" .. #info:GetChildren())
+        info.ChildAdded:Connect(function(c)
+            if not ecOn then return end
+            dbg("info.ChildAdded", c.Name)
+            if INFO_FLAGS[c.Name] then fireEC("info:" .. c.Name) end
+        end)
+    end)
+end
+
+-- ============================================
+-- S2: Humanoid.HealthChanged
+-- ============================================
+local function hookHumanoid(char)
+    task.spawn(function()
+        local hum = char:WaitForChild("Humanoid", 5)
+        if not hum then return end
+        local lastHP = hum.Health
+        hum.HealthChanged:Connect(function(hp)
+            if not ecOn then return end
+            if lastHP and hp < lastHP - HEALTH_DROP_MIN then
+                dbg("HealthChanged", string.format("%.1f -> %.1f", lastHP, hp))
+                fireEC("health")
+            end
+            lastHP = hp
+        end)
+
+        -- S3: state changed
+        hum.StateChanged:Connect(function(_, new)
+            if not ecOn then return end
+            if new == Enum.HumanoidStateType.FallingDown
+                or new == Enum.HumanoidStateType.Ragdoll
+                or new == Enum.HumanoidStateType.PlatformStanding then
+                dbg("StateChanged", tostring(new))
+                fireEC("state:" .. new.Name)
+            end
+        end)
+    end)
+end
+
+-- ============================================
+-- S4: character attribute changes
+-- ============================================
+local WATCHED_ATTRS = {"Ragdoll", "Stun", "Dead", "Burst"}
+local function hookAttrs(char)
+    for _, name in WATCHED_ATTRS do
+        task.spawn(function()
+            char:GetAttributeChangedSignal(name):Connect(function()
+                if not ecOn then return end
+                local v = char:GetAttribute(name)
+                dbg("attr:" .. name, tostring(v))
+                if v and (type(v) == "boolean" and v or (type(v) == "number" and v > 0)) then
+                    fireEC("attr:" .. name)
+                end
+            end)
+        end)
+    end
+end
+
+-- ============================================
+-- S5: HumanoidRootPart velocity spike (knockback)
+-- ============================================
+local function hookHRP(char)
+    task.spawn(function()
+        local hrp = char:WaitForChild("HumanoidRootPart", 5)
+        if not hrp then return end
+        local lastVel = Vector3.zero
+        local conn
+        conn = RunService.Heartbeat:Connect(function()
+            if not ecOn then return end
+            if not hrp.Parent then conn:Disconnect() return end
+            local v = hrp.AssemblyLinearVelocity
+            local delta = (v - lastVel).Magnitude
+            if delta > VELOCITY_SPIKE and v.Magnitude > VELOCITY_SPIKE then
+                -- Only count as knockback if we didn't initiate it ourselves
+                -- (our own dash wouldn't cause a sudden external spike)
+                dbg("velocity-spike", string.format("%.1f", delta))
+                fireEC("velocity")
+            end
+            lastVel = v
+        end)
+    end)
+end
+
+-- ============================================
+-- S6: all Knit RemoteEvents with our char as arg
+-- ============================================
+local function hookRemotes()
+    task.spawn(function()
+        local knitFolder = RS:FindFirstChild("Knit")
+        if not knitFolder then return end
+        local services = knitFolder:FindFirstChild("Services")
+        if not services then return end
+
+        local function hook(re, svcName)
+            if not re:IsA("RemoteEvent") then return end
+            re.OnClientEvent:Connect(function(...)
+                if not ecOn then return end
+                if svcName == "EyeCatchService" then return end
+                local myChar = LocalPlayer.Character
+                if not myChar then return end
+                local args = {...}
+                for _, arg in args do
+                    if typeof(arg) == "Instance" and (arg == myChar or arg == LocalPlayer) then
+                        dbg("remote", svcName .. "." .. re.Name)
+                        fireEC("rem:" .. svcName)
+                        return
+                    end
+                    -- table of targets (many hit events pass a list)
+                    if type(arg) == "table" then
+                        for _, v in arg do
+                            if v == myChar or v == LocalPlayer then
+                                dbg("remote-list", svcName .. "." .. re.Name)
+                                fireEC("remL:" .. svcName)
+                                return
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+
+        local function scan(svc)
+            local re = svc:FindFirstChild("RE")
+            if not re then return end
+            for _, r in re:GetChildren() do hook(r, svc.Name) end
+            re.ChildAdded:Connect(function(c) hook(c, svc.Name) end)
+        end
+        for _, svc in services:GetChildren() do scan(svc) end
+        services.ChildAdded:Connect(scan)
+        dbg("REMOTES-HOOKED", #services:GetChildren() .. " services")
+    end)
+end
+hookRemotes()
+
+-- ============================================
+-- CHARACTER SETUP
+-- ============================================
+local function setup(char)
+    character = char
+    cachedSkill, cachedKey = nil, nil
+    ecService = nil
+    hookInfo(char)
+    hookHumanoid(char)
+    hookAttrs(char)
+    hookHRP(char)
+    task.wait(0.3)
+    findEC()
+    getEcService()
+    dbg("CHAR-SETUP", char.Name)
+end
+setup(character)
+LocalPlayer.CharacterAdded:Connect(function(c)
+    task.wait(0.3)
+    setup(c)
+end)
+
+-- ============================================
+-- GUI
+-- ============================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("ECXv4"):Destroy() end)
+pcall(function() LocalPlayer.PlayerGui:FindFirstChild("ECXv4"):Destroy() end)
+
+local guiParent
+local ok1 = pcall(function()
+    local g = Instance.new("ScreenGui")
+    g.Name = "ECXv4" g.ResetOnSpawn = false
+    g.Parent = game:GetService("CoreGui")
+    guiParent = g
+end)
+if not ok1 then
+    local g = Instance.new("ScreenGui")
+    g.Name = "ECXv4" g.ResetOnSpawn = false
+    g.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    guiParent = g
+end
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 210, 0, 138)
+fr.Position = UDim2.new(1, -220, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", fr).Color = Color3.fromRGB(230, 100, 60)
+
+local dragging, ds, sp
+fr.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = true ds = i.Position sp = fr.Position
+        i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - ds
+        fr.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
+    end
+end)
+
+local titleL = Instance.new("TextLabel")
+titleL.Size = UDim2.new(0.65, 0, 0, 14) titleL.Position = UDim2.new(0, 8, 0, 4)
+titleL.BackgroundTransparency = 1 titleL.Text = "EYE CATCHING v4"
+titleL.TextColor3 = Color3.fromRGB(255, 120, 80)
+titleL.TextSize = 11 titleL.Font = Enum.Font.GothamBold
+titleL.TextXAlignment = Enum.TextXAlignment.Left titleL.Parent = fr
+
+local countL = Instance.new("TextLabel")
+countL.Size = UDim2.new(0.35, -8, 0, 14) countL.Position = UDim2.new(0.65, 0, 0, 4)
+countL.BackgroundTransparency = 1 countL.Text = "0"
+countL.TextColor3 = Color3.fromRGB(140, 140, 150)
+countL.TextSize = 11 countL.Font = Enum.Font.Gotham
+countL.TextXAlignment = Enum.TextXAlignment.Right countL.Parent = fr
+
+local skillL = Instance.new("TextLabel")
+skillL.Size = UDim2.new(1, -16, 0, 12) skillL.Position = UDim2.new(0, 8, 0, 20)
+skillL.BackgroundTransparency = 1 skillL.Text = "Skill: -"
+skillL.TextColor3 = Color3.fromRGB(180, 180, 200)
+skillL.TextSize = 10 skillL.Font = Enum.Font.Gotham
+skillL.TextXAlignment = Enum.TextXAlignment.Left skillL.Parent = fr
+
+local reasonL = Instance.new("TextLabel")
+reasonL.Size = UDim2.new(1, -16, 0, 12) reasonL.Position = UDim2.new(0, 8, 0, 34)
+reasonL.BackgroundTransparency = 1 reasonL.Text = "Last: -"
+reasonL.TextColor3 = Color3.fromRGB(200, 220, 230)
+reasonL.TextSize = 10 reasonL.Font = Enum.Font.Code
+reasonL.TextXAlignment = Enum.TextXAlignment.Left reasonL.Parent = fr
+
+local modeL = Instance.new("TextLabel")
+modeL.Size = UDim2.new(1, -16, 0, 12) modeL.Position = UDim2.new(0, 8, 0, 48)
+modeL.BackgroundTransparency = 1 modeL.Text = "Mode: PURE REACTIVE (no anim)"
+modeL.TextColor3 = Color3.fromRGB(160, 220, 160)
+modeL.TextSize = 10 modeL.Font = Enum.Font.Gotham
+modeL.TextXAlignment = Enum.TextXAlignment.Left modeL.Parent = fr
+
+local toggleB = Instance.new("TextButton")
+toggleB.Size = UDim2.new(0.6, -7, 0, 28) toggleB.Position = UDim2.new(0, 7, 0, 64)
+toggleB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) toggleB.Text = "OFF"
+toggleB.TextColor3 = Color3.fromRGB(200, 200, 210) toggleB.TextSize = 13 toggleB.Font = Enum.Font.GothamBold
+toggleB.Parent = fr Instance.new("UICorner", toggleB).CornerRadius = UDim.new(0, 6)
+toggleB.MouseButton1Click:Connect(function()
+    ecOn = not ecOn
+    toggleB.Text = ecOn and "ON" or "OFF"
+    toggleB.BackgroundColor3 = ecOn and Color3.fromRGB(220, 60, 40) or Color3.fromRGB(35, 35, 45)
+end)
+
+local dbgB = Instance.new("TextButton")
+dbgB.Size = UDim2.new(0.4, -7, 0, 28) dbgB.Position = UDim2.new(0.6, 0, 0, 64)
+dbgB.BackgroundColor3 = DEBUG and Color3.fromRGB(60, 80, 140) or Color3.fromRGB(35, 35, 45)
+dbgB.Text = DEBUG and "DBG ON" or "DBG OFF"
+dbgB.TextColor3 = Color3.fromRGB(200, 200, 210) dbgB.TextSize = 11 dbgB.Font = Enum.Font.GothamBold
+dbgB.Parent = fr Instance.new("UICorner", dbgB).CornerRadius = UDim.new(0, 6)
+dbgB.MouseButton1Click:Connect(function()
+    DEBUG = not DEBUG
+    dbgB.Text = DEBUG and "DBG ON" or "DBG OFF"
+    dbgB.BackgroundColor3 = DEBUG and Color3.fromRGB(60, 80, 140) or Color3.fromRGB(35, 35, 45)
+end)
+
+local hintL = Instance.new("TextLabel")
+hintL.Size = UDim2.new(1, -16, 0, 24) hintL.Position = UDim2.new(0, 8, 0, 98)
+hintL.BackgroundTransparency = 1
+hintL.Text = "Check F9 console for signal order when hit"
+hintL.TextColor3 = Color3.fromRGB(120, 130, 150)
+hintL.TextSize = 9 hintL.Font = Enum.Font.Gotham
+hintL.TextXAlignment = Enum.TextXAlignment.Left hintL.Parent = fr
+
+task.spawn(function()
+    while true do
+        pcall(function()
+            countL.Text = tostring(fires)
+            local skill, key = findEC()
+            if skill and key then
+                skillL.Text = "Skill: " .. skill.Name .. " @ " .. string.char(key)
+                skillL.TextColor3 = Color3.fromRGB(120, 220, 120)
+            else
+                skillL.Text = "Skill: NOT equipped"
+                skillL.TextColor3 = Color3.fromRGB(230, 130, 130)
+            end
+            reasonL.Text = "Last: " .. lastReason
+        end)
+        task.wait(0.15)
+    end
+end)
+
+print("[AutoEC v4] PURE REACTIVE. Debug ON — check F9 console for signal order.")
