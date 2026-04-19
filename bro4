@@ -1,0 +1,441 @@
+-- ============================================
+-- AUTO EYE CATCHING v3 — Reactive Counter
+-- Hooks the EARLIEST defender-side signals of being hit:
+--   1. character.Info.ChildAdded (Stun/Block/Knockback added)
+--   2. Humanoid.HealthChanged (any damage)
+--   3. All Knit RE.OnClientEvent with self as target
+--   4. Animation pre-emptive (fallback)
+-- Fires via Knit service directly for minimum latency.
+-- ============================================
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================
+-- KNIT ACCESS
+-- ============================================
+local Knit
+local ecService
+local function loadKnit()
+    pcall(function()
+        Knit = require(RS:WaitForChild("Knit"):WaitForChild("Knit"))
+    end)
+end
+loadKnit()
+
+local function getEcService()
+    if ecService then return ecService end
+    if not Knit then return nil end
+    local ok, svc = pcall(function() return Knit.GetService("EyeCatchService") end)
+    if ok and svc then
+        ecService = svc
+        return svc
+    end
+    return nil
+end
+
+-- ============================================
+-- TUNABLES
+-- ============================================
+local REACTIVE_COOLDOWN  = 0.25   -- shorter CD for reactive fires
+local ANIM_COOLDOWN      = 0.45   -- longer CD for pre-emptive (to avoid double-fire with reactive)
+local REACT_RANGE        = 16
+local FACING_DOT_CLOSE   = 0.72
+local FACING_DOT_FAR     = 0.88
+local MELEE_RANGE        = 8
+
+-- ============================================
+-- STATE
+-- ============================================
+local ecOn = false
+local fires = 0
+local lastFire = 0
+local lastReason = "-"
+local lastSelfAction = 0
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+
+-- ============================================
+-- SKILL DISCOVERY
+-- ============================================
+local cachedSkill, cachedKey = nil, nil
+local function findEyeCatching()
+    local char = LocalPlayer.Character
+    if not char then return nil, nil end
+    if cachedSkill and cachedSkill.Parent then return cachedSkill, cachedKey end
+    local moveset = char:FindFirstChild("Moveset")
+    if not moveset then return nil, nil end
+    for _, skill in moveset:GetChildren() do
+        local n = skill.Name:lower():gsub("%s", "")
+        if n == "eyecatching" or n == "eyecatch" then
+            local k = skill:GetAttribute("Key")
+            local kc = 0x33
+            if k == 1 then kc = 0x31
+            elseif k == 2 then kc = 0x32
+            elseif k == 3 then kc = 0x33
+            elseif k == 4 then kc = 0x34 end
+            cachedSkill, cachedKey = skill, kc
+            return skill, kc
+        end
+    end
+    return nil, nil
+end
+
+-- ============================================
+-- FIRE — direct Knit fire for lowest latency, keypress+click fallback
+-- ============================================
+local function fireEC(reason, bypassCD)
+    if not ecOn then return end
+    if not bypassCD then
+        local cd = reason == "anim" and ANIM_COOLDOWN or REACTIVE_COOLDOWN
+        if (tick() - lastFire) < cd then return end
+    end
+
+    local skill, key = findEyeCatching()
+    if not skill or not key then return end
+
+    lastFire = tick()
+    fires = fires + 1
+    lastReason = reason
+
+    -- Path 1: Direct Knit service fire (fastest — skips all input pipeline)
+    local svc = getEcService()
+    if svc and svc.Activated then
+        pcall(function()
+            svc.Activated:Fire(skill, false)
+        end)
+    end
+
+    -- Path 2: Keypress + mouse click (redundancy in case direct fire is validated against input state)
+    pcall(function()
+        keypress(key)
+        task.delay(0.02, function()
+            pcall(function()
+                if mouse1click then mouse1click()
+                elseif mouse1press and mouse1release then
+                    mouse1press() task.wait(0.015) mouse1release()
+                end
+            end)
+        end)
+        task.delay(0.08, function() pcall(keyrelease, key) end)
+    end)
+end
+
+-- ============================================
+-- SELF-ACTION TRACKING
+-- ============================================
+UIS.InputBegan:Connect(function(i, gpe)
+    if gpe then return end
+    if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.KeyCode == Enum.KeyCode.F or i.KeyCode == Enum.KeyCode.R
+        or i.KeyCode == Enum.KeyCode.E or i.KeyCode == Enum.KeyCode.G
+        or i.KeyCode == Enum.KeyCode.One or i.KeyCode == Enum.KeyCode.Two
+        or i.KeyCode == Enum.KeyCode.Three or i.KeyCode == Enum.KeyCode.Four then
+        lastSelfAction = tick()
+    end
+end)
+
+-- ============================================
+-- REACTIVE TRIGGER 1 — character.Info.ChildAdded
+-- This is the EARLIEST signal: server adds a BoolValue to our Info folder
+-- ============================================
+local HIT_FLAGS = {
+    Stun = true, Block = false, Knockback = true, Ragdoll = true,
+    IFrame = false, NoM1 = true, NoDash = true, DirectionLock = true,
+}
+
+local function hookInfoFolder(char)
+    task.spawn(function()
+        local info
+        for _ = 1, 50 do
+            info = char:FindFirstChild("Info")
+            if info then break end
+            task.wait(0.05)
+        end
+        if not info then return end
+
+        info.ChildAdded:Connect(function(c)
+            if not ecOn then return end
+            -- Only react to actual hit-state flags
+            if HIT_FLAGS[c.Name] then
+                -- This is reactive — fire immediately with CD bypass
+                -- (EC activation might still race the stun on the server)
+                fireEC("info:" .. c.Name, true)
+            end
+        end)
+    end)
+end
+
+-- ============================================
+-- REACTIVE TRIGGER 2 — Humanoid damage
+-- ============================================
+local lastHealth = nil
+local function hookHumanoid(char)
+    task.spawn(function()
+        local hum = char:WaitForChild("Humanoid", 5)
+        if not hum then return end
+        lastHealth = hum.Health
+        hum.HealthChanged:Connect(function(newHealth)
+            if not ecOn then return end
+            if lastHealth and newHealth < lastHealth - 0.5 then
+                fireEC("health", true)
+            end
+            lastHealth = newHealth
+        end)
+    end)
+end
+
+-- ============================================
+-- REACTIVE TRIGGER 3 — HRP attribute changes (Ragdoll etc)
+-- ============================================
+local function hookHRP(char)
+    task.spawn(function()
+        local hrp = char:WaitForChild("HumanoidRootPart", 5)
+        if not hrp then return end
+        -- The game uses character-level attributes for some states
+        char:GetAttributeChangedSignal("Ragdoll"):Connect(function()
+            if not ecOn then return end
+            local r = char:GetAttribute("Ragdoll")
+            if r and r > 0 then fireEC("ragdoll", true) end
+        end)
+    end)
+end
+
+-- ============================================
+-- REACTIVE TRIGGER 4 — all Knit RE OnClientEvent
+-- When any service fires an event with our character as an arg
+-- ============================================
+local function hookAllRemotes()
+    task.spawn(function()
+        local knitFolder = RS:FindFirstChild("Knit")
+        if not knitFolder then return end
+        local services = knitFolder:FindFirstChild("Services")
+        if not services then return end
+
+        local function hookRemote(re, serviceName)
+            if not re:IsA("RemoteEvent") then return end
+            re.OnClientEvent:Connect(function(...)
+                if not ecOn then return end
+                -- Skip our own service events to avoid self-triggering
+                if serviceName == "EyeCatchService" then return end
+                local myChar = LocalPlayer.Character
+                if not myChar then return end
+                for _, arg in {...} do
+                    if typeof(arg) == "Instance" and arg == myChar then
+                        fireEC("remote:" .. serviceName .. "." .. re.Name, true)
+                        return
+                    end
+                end
+            end)
+        end
+
+        local function scanService(svc)
+            local re = svc:FindFirstChild("RE")
+            if not re then return end
+            for _, remote in re:GetChildren() do
+                hookRemote(remote, svc.Name)
+            end
+            re.ChildAdded:Connect(function(c) hookRemote(c, svc.Name) end)
+        end
+
+        for _, svc in services:GetChildren() do scanService(svc) end
+        services.ChildAdded:Connect(scanService)
+    end)
+end
+hookAllRemotes()
+
+-- ============================================
+-- PRE-EMPTIVE TRIGGER — animation detection (fallback)
+-- ============================================
+local SAFE = {}
+for _, id in {"180435571","180435792","15621270146","7012721719","180436334","9442520397","178130996"} do
+    SAFE[id] = true
+end
+
+local function isCombatAnim(track)
+    if not track or not track.Animation then return false end
+    local id = track.Animation.AnimationId
+    if not id then return false end
+    local n = id:match("%d+")
+    return n and not SAFE[n]
+end
+
+local function watchPlayer(p)
+    if p == LocalPlayer then return end
+    local function onChar(char)
+        pcall(function()
+            local hum = char:WaitForChild("Humanoid", 10)
+            if not hum then return end
+            local animator = hum:WaitForChild("Animator", 5)
+            if not animator then return end
+            animator.AnimationPlayed:Connect(function(track)
+                if not ecOn then return end
+                if not isCombatAnim(track) then return end
+                local myChar = LocalPlayer.Character
+                if not myChar then return end
+                local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+                local theirRoot = char:FindFirstChild("HumanoidRootPart")
+                if not myRoot or not theirRoot then return end
+                local delta = myRoot.Position - theirRoot.Position
+                local dist = delta.Magnitude
+                if dist > REACT_RANGE or dist < 0.1 then return end
+                local toMe = delta.Unit
+                local theirDot = theirRoot.CFrame.LookVector:Dot(toMe)
+                local requiredDot = dist <= MELEE_RANGE and FACING_DOT_CLOSE or FACING_DOT_FAR
+                if theirDot >= requiredDot then
+                    fireEC("anim")
+                end
+            end)
+        end)
+    end
+    if p.Character then onChar(p.Character) end
+    p.CharacterAdded:Connect(onChar)
+end
+for _, p in Players:GetPlayers() do watchPlayer(p) end
+Players.PlayerAdded:Connect(watchPlayer)
+
+-- ============================================
+-- CHARACTER SETUP
+-- ============================================
+local function setupCharacter(char)
+    character = char
+    cachedSkill, cachedKey = nil, nil
+    lastHealth = nil
+    ecService = nil -- re-fetch on respawn
+    hookInfoFolder(char)
+    hookHumanoid(char)
+    hookHRP(char)
+    task.wait(0.3)
+    findEyeCatching()
+    getEcService()
+end
+setupCharacter(character)
+LocalPlayer.CharacterAdded:Connect(function(char)
+    task.wait(0.3)
+    setupCharacter(char)
+end)
+
+-- ============================================
+-- GUI
+-- ============================================
+pcall(function() game:GetService("CoreGui"):FindFirstChild("ECXv3"):Destroy() end)
+pcall(function() LocalPlayer.PlayerGui:FindFirstChild("ECXv3"):Destroy() end)
+
+local guiParent
+local ok1 = pcall(function()
+    local g = Instance.new("ScreenGui")
+    g.Name = "ECXv3" g.ResetOnSpawn = false
+    g.Parent = game:GetService("CoreGui")
+    guiParent = g
+end)
+if not ok1 then
+    local g = Instance.new("ScreenGui")
+    g.Name = "ECXv3" g.ResetOnSpawn = false
+    g.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    guiParent = g
+end
+
+local fr = Instance.new("Frame")
+fr.Size = UDim2.new(0, 200, 0, 128)
+fr.Position = UDim2.new(1, -210, 0, 10)
+fr.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
+fr.BorderSizePixel = 0 fr.Active = true fr.Parent = guiParent
+Instance.new("UICorner", fr).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", fr).Color = Color3.fromRGB(200, 100, 80)
+
+local dragging, dragStart, startPos
+fr.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = true dragStart = i.Position startPos = fr.Position
+        i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        fr.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+
+local titleL = Instance.new("TextLabel")
+titleL.Size = UDim2.new(0.65, 0, 0, 14) titleL.Position = UDim2.new(0, 8, 0, 4)
+titleL.BackgroundTransparency = 1 titleL.Text = "EYE CATCHING v3"
+titleL.TextColor3 = Color3.fromRGB(255, 140, 80)
+titleL.TextSize = 11 titleL.Font = Enum.Font.GothamBold
+titleL.TextXAlignment = Enum.TextXAlignment.Left titleL.Parent = fr
+
+local countL = Instance.new("TextLabel")
+countL.Size = UDim2.new(0.35, -8, 0, 14) countL.Position = UDim2.new(0.65, 0, 0, 4)
+countL.BackgroundTransparency = 1 countL.Text = "0"
+countL.TextColor3 = Color3.fromRGB(140, 140, 150)
+countL.TextSize = 11 countL.Font = Enum.Font.Gotham
+countL.TextXAlignment = Enum.TextXAlignment.Right countL.Parent = fr
+
+local skillL = Instance.new("TextLabel")
+skillL.Size = UDim2.new(1, -16, 0, 12) skillL.Position = UDim2.new(0, 8, 0, 20)
+skillL.BackgroundTransparency = 1 skillL.Text = "Skill: searching..."
+skillL.TextColor3 = Color3.fromRGB(180, 180, 200)
+skillL.TextSize = 10 skillL.Font = Enum.Font.Gotham
+skillL.TextXAlignment = Enum.TextXAlignment.Left skillL.Parent = fr
+
+local reasonL = Instance.new("TextLabel")
+reasonL.Size = UDim2.new(1, -16, 0, 12) reasonL.Position = UDim2.new(0, 8, 0, 34)
+reasonL.BackgroundTransparency = 1 reasonL.Text = "Last: -"
+reasonL.TextColor3 = Color3.fromRGB(180, 200, 220)
+reasonL.TextSize = 10 reasonL.Font = Enum.Font.Code
+reasonL.TextXAlignment = Enum.TextXAlignment.Left reasonL.Parent = fr
+
+local svcL = Instance.new("TextLabel")
+svcL.Size = UDim2.new(1, -16, 0, 12) svcL.Position = UDim2.new(0, 8, 0, 48)
+svcL.BackgroundTransparency = 1 svcL.Text = "Knit: ..."
+svcL.TextColor3 = Color3.fromRGB(160, 220, 160)
+svcL.TextSize = 10 svcL.Font = Enum.Font.Gotham
+svcL.TextXAlignment = Enum.TextXAlignment.Left svcL.Parent = fr
+
+local toggleB = Instance.new("TextButton")
+toggleB.Size = UDim2.new(1, -14, 0, 28) toggleB.Position = UDim2.new(0, 7, 0, 66)
+toggleB.BackgroundColor3 = Color3.fromRGB(35, 35, 45) toggleB.Text = "OFF"
+toggleB.TextColor3 = Color3.fromRGB(200, 200, 210) toggleB.TextSize = 13 toggleB.Font = Enum.Font.GothamBold
+toggleB.Parent = fr Instance.new("UICorner", toggleB).CornerRadius = UDim.new(0, 6)
+toggleB.MouseButton1Click:Connect(function()
+    ecOn = not ecOn
+    toggleB.Text = ecOn and "ON" or "OFF"
+    toggleB.BackgroundColor3 = ecOn and Color3.fromRGB(200, 80, 60) or Color3.fromRGB(35, 35, 45)
+end)
+
+local hintL = Instance.new("TextLabel")
+hintL.Size = UDim2.new(1, -16, 0, 24) hintL.Position = UDim2.new(0, 8, 0, 98)
+hintL.BackgroundTransparency = 1
+hintL.Text = "Reactive: hooks Info/HP/remotes\nPre-emptive: animation (fallback)"
+hintL.TextColor3 = Color3.fromRGB(120, 130, 150)
+hintL.TextSize = 9 hintL.Font = Enum.Font.Gotham
+hintL.TextXAlignment = Enum.TextXAlignment.Left hintL.Parent = fr
+
+task.spawn(function()
+    while true do
+        pcall(function()
+            countL.Text = tostring(fires)
+            local skill, key = findEyeCatching()
+            if skill and key then
+                skillL.Text = "Skill: '" .. skill.Name .. "' @ " .. string.char(key)
+                skillL.TextColor3 = Color3.fromRGB(120, 220, 120)
+            else
+                skillL.Text = "Skill: NOT equipped"
+                skillL.TextColor3 = Color3.fromRGB(230, 130, 130)
+            end
+            reasonL.Text = "Last: " .. lastReason
+            if ecService then
+                svcL.Text = "Knit: EyeCatchService ready"
+                svcL.TextColor3 = Color3.fromRGB(160, 220, 160)
+            else
+                svcL.Text = "Knit: not loaded (keypress only)"
+                svcL.TextColor3 = Color3.fromRGB(230, 170, 110)
+                getEcService()
+            end
+        end)
+        task.wait(0.2)
+    end
+end)
+
+print("[AutoEC v3] Loaded. Reactive hooks: Info + HP + Remotes. Pre-emptive: anim.")
