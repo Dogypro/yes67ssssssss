@@ -1,0 +1,360 @@
+--!nocheck
+--[[
+	REMOTE HANDLER AUDIT  ·  Roblox Studio Command Bar
+
+	Paste into the Command Bar with the place open. (If multi-line paste misbehaves
+	in your Studio build, drop it into a temporary Script under ServerScriptService
+	and run it in a Studio play test instead — Source reads still work there.)
+
+	Static analysis only. Nothing is fired, invoked, or connected. For every
+	RemoteEvent / RemoteFunction / UnreliableRemoteEvent under the remote roots
+	it reports:
+	    · server scripts that bind OnServerEvent / OnServerInvoke, with line numbers
+	    · remotes referenced server-side but never bound
+	    · remotes with no server-side reference at all
+	    · OnServer* binds it could not attribute to a literal remote name
+
+	Reading LuaSourceContainer.Source requires plugin security, which the
+	Command Bar has. This will not work from a live-game runtime context.
+--]]
+
+local CONFIG = {
+	RemoteRootNames = { "ReplicatedStorage" },
+	ServerRootNames = { "ServerScriptService", "ServerStorage" },
+	RemoteClasses = {
+		RemoteEvent = true,
+		RemoteFunction = true,
+		UnreliableRemoteEvent = true,
+	},
+	MaxLinesShown = 4,
+	ShowSourcePreview = true,
+	PreviewWidth = 92,
+}
+
+local ScriptEditorService = game:GetService("ScriptEditorService")
+
+--------------------------------------------------------------------------------
+-- helpers
+--------------------------------------------------------------------------------
+
+local function services(names)
+	local out = {}
+	for _, name in ipairs(names) do
+		local ok, svc = pcall(game.GetService, game, name)
+		if ok and svc then
+			table.insert(out, svc)
+		end
+	end
+	return out
+end
+
+local function readSource(inst)
+	local ok, src = pcall(function()
+		return inst.Source
+	end)
+	if ok and type(src) == "string" and #src > 0 then
+		return src
+	end
+	local ok2, src2 = pcall(function()
+		return ScriptEditorService:GetEditorSource(inst)
+	end)
+	if ok2 and type(src2) == "string" then
+		return src2
+	end
+	return nil
+end
+
+-- Strips comments while preserving line numbering. Heuristic: string literals are
+-- not tracked, so a "--" inside a string truncates that line early.
+local function stripComments(src)
+	local lines, inBlock, eqs = {}, false, ""
+	for raw in (src .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+		local line = raw
+		if inBlock then
+			local _, e = line:find("%]" .. eqs .. "%]")
+			if e then
+				line, inBlock = line:sub(e + 1), false
+			else
+				line = ""
+			end
+		end
+		local s = line:find("--", 1, true)
+		if s then
+			local open = line:match("^%-%-%[(=*)%[", s)
+			if open then
+				eqs, inBlock = open, true
+			end
+			line = line:sub(1, s - 1)
+		end
+		table.insert(lines, line)
+	end
+	return lines
+end
+
+local function escape(s)
+	return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
+end
+
+local function refPatterns(name)
+	local e = escape(name)
+	return {
+		"%f[%w_]" .. e .. "%f[^%w_]", -- Events.Tables.Name
+		"%[%s*[\"']" .. e .. "[\"']%s*%]", -- Events.Tables["Name"]
+		"%(%s*[\"']" .. e .. "[\"']%s*%)", -- :WaitForChild("Name")
+	}
+end
+
+local BIND = "%s*%.%s*(OnServer%w+)"
+
+local function trim(s)
+	return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local function findAliases(lines, pats)
+	local aliases = {}
+	for i, line in ipairs(lines) do
+		local lhs, rhs = line:match("^%s*local%s+([%w_]+)%s*=%s*(.+)$")
+		if not lhs then
+			lhs, rhs = line:match("^%s*([%w_]+)%s*=%s*(.+)$")
+		end
+		if lhs and rhs then
+			for _, p in ipairs(pats) do
+				if rhs:find(p) then
+					aliases[lhs] = i
+					break
+				end
+			end
+		end
+	end
+	return aliases
+end
+
+--------------------------------------------------------------------------------
+-- gather
+--------------------------------------------------------------------------------
+
+local remoteRoots = services(CONFIG.RemoteRootNames)
+local serverRoots = services(CONFIG.ServerRootNames)
+
+local remotes = {}
+for _, root in ipairs(remoteRoots) do
+	for _, d in ipairs(root:GetDescendants()) do
+		if CONFIG.RemoteClasses[d.ClassName] then
+			table.insert(remotes, d)
+		end
+	end
+end
+table.sort(remotes, function(a, b)
+	return a:GetFullName() < b:GetFullName()
+end)
+
+local sources = {}
+for _, root in ipairs(serverRoots) do
+	for _, d in ipairs(root:GetDescendants()) do
+		if (d:IsA("Script") or d:IsA("ModuleScript")) and not d:IsA("LocalScript") then
+			local src = readSource(d)
+			if src then
+				local lines = stripComments(src)
+				local entry = {
+					path = d:GetFullName(),
+					lines = lines,
+					blob = table.concat(lines, "\n"),
+					disabled = false,
+					runContext = nil,
+					bindLines = {},
+					attributed = {},
+				}
+				pcall(function()
+					entry.disabled = d.Disabled == true
+				end)
+				pcall(function()
+					entry.runContext = d.RunContext.Name
+				end)
+				for i, line in ipairs(lines) do
+					if line:find("OnServer%w+") then
+						table.insert(entry.bindLines, i)
+					end
+				end
+				table.insert(sources, entry)
+			end
+		end
+	end
+end
+table.sort(sources, function(a, b)
+	return a.path < b.path
+end)
+
+--------------------------------------------------------------------------------
+-- analyse
+--------------------------------------------------------------------------------
+
+local bound, refOnly, unreferenced = {}, {}, {}
+
+for _, remote in ipairs(remotes) do
+	local pats = refPatterns(remote.Name)
+	local wordPat = pats[1]
+	local binds, refs = {}, {}
+
+	for _, s in ipairs(sources) do
+		if s.blob:find(wordPat) then
+			local bindPats = table.clone(pats)
+			for alias in pairs(findAliases(s.lines, pats)) do
+				table.insert(bindPats, "%f[%w_]" .. escape(alias) .. "%f[^%w_]")
+			end
+
+			local firstRef, hits = nil, {}
+			for i, line in ipairs(s.lines) do
+				if not firstRef and line:find(wordPat) then
+					firstRef = i
+				end
+				for _, p in ipairs(bindPats) do
+					local kind = line:match(p .. BIND)
+					if kind then
+						table.insert(hits, { line = i, kind = kind, text = trim(line) })
+						s.attributed[i] = true
+						break
+					end
+				end
+			end
+
+			if #hits > 0 then
+				table.insert(binds, { source = s, hits = hits })
+			elseif firstRef then
+				table.insert(refs, { source = s, line = firstRef })
+			end
+		end
+	end
+
+	local rec = { remote = remote, binds = binds, refs = refs }
+	if #binds > 0 then
+		table.insert(bound, rec)
+	elseif #refs > 0 then
+		table.insert(refOnly, rec)
+	else
+		table.insert(unreferenced, rec)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- report
+--------------------------------------------------------------------------------
+
+local buf = {}
+local function emit(s)
+	table.insert(buf, s or "")
+	if #buf >= 25 then
+		print(table.concat(buf, "\n"))
+		table.clear(buf)
+	end
+end
+local function flush()
+	if #buf > 0 then
+		print(table.concat(buf, "\n"))
+		table.clear(buf)
+	end
+end
+
+local RULE, THIN = string.rep("=", 78), string.rep("-", 78)
+
+local function rootNames(list)
+	local n = {}
+	for _, s in ipairs(list) do
+		table.insert(n, s.Name)
+	end
+	return #n > 0 and table.concat(n, ", ") or "(none resolved)"
+end
+
+emit(RULE)
+emit("REMOTE HANDLER AUDIT")
+emit("remote roots : " .. rootNames(remoteRoots))
+emit("server roots : " .. rootNames(serverRoots))
+emit(string.format("remotes      : %d     server sources : %d", #remotes, #sources))
+emit(string.format("bound        : %d     ref-only : %d     unreferenced : %d", #bound, #refOnly, #unreferenced))
+emit(RULE)
+
+emit("")
+emit(string.format("BOUND  (%d)", #bound))
+emit(THIN)
+for _, rec in ipairs(bound) do
+	emit(string.format("[+] %-22s %s", rec.remote.ClassName, rec.remote:GetFullName()))
+	for _, b in ipairs(rec.binds) do
+		for i, hit in ipairs(b.hits) do
+			if i > CONFIG.MaxLinesShown then
+				emit(string.format("        %s  (+%d more)", b.source.path, #b.hits - CONFIG.MaxLinesShown))
+				break
+			end
+			emit(string.format("        %s:%d  %s", b.source.path, hit.line, hit.kind))
+			if CONFIG.ShowSourcePreview then
+				local t = hit.text
+				if #t > CONFIG.PreviewWidth then
+					t = t:sub(1, CONFIG.PreviewWidth - 1) .. "..."
+				end
+				emit("            " .. t)
+			end
+		end
+		if b.source.disabled then
+			emit("        ^ script is Disabled")
+		end
+		if b.source.runContext == "Client" then
+			emit("        ^ RunContext = Client, will not run on the server")
+		end
+	end
+end
+
+emit("")
+emit(string.format("REFERENCED SERVER-SIDE, NEVER BOUND  (%d)", #refOnly))
+emit(THIN)
+for _, rec in ipairs(refOnly) do
+	emit(string.format("[~] %-22s %s", rec.remote.ClassName, rec.remote:GetFullName()))
+	for i, r in ipairs(rec.refs) do
+		if i > CONFIG.MaxLinesShown then
+			emit(string.format("        (+%d more)", #rec.refs - CONFIG.MaxLinesShown))
+			break
+		end
+		emit(string.format("        %s:%d", r.source.path, r.line))
+	end
+end
+
+emit("")
+emit(string.format("NO SERVER-SIDE REFERENCE  (%d)", #unreferenced))
+emit(THIN)
+for _, rec in ipairs(unreferenced) do
+	emit(string.format("[!] %-22s %s", rec.remote.ClassName, rec.remote:GetFullName()))
+end
+
+emit("")
+local dynTotal, dynRows = 0, {}
+for _, s in ipairs(sources) do
+	local leftover = 0
+	for _, i in ipairs(s.bindLines) do
+		if not s.attributed[i] then
+			leftover += 1
+		end
+	end
+	if leftover > 0 then
+		dynTotal += leftover
+		table.insert(dynRows, string.format("        %-58s %d", s.path, leftover))
+	end
+end
+emit(string.format("UNATTRIBUTED OnServer* BINDS  (%d)", dynTotal))
+emit(THIN)
+if dynTotal == 0 then
+	emit("        none")
+else
+	emit("        bound through a variable or loop rather than a literal name;")
+	emit("        remotes listed above as unbound may in fact be handled here")
+	for _, row in ipairs(dynRows) do
+		emit(row)
+	end
+end
+
+emit(RULE)
+flush()
+
+if #unreferenced + #refOnly > 0 then
+	warn(string.format(
+		"[remote audit] %d remotes without a resolved server binding (%d never referenced)",
+		#unreferenced + #refOnly,
+		#unreferenced
+	))
+end
