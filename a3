@@ -1,0 +1,619 @@
+--[[ ==========================================================================
+     ROBLOX SCRIPT DUMP  --  paste into the Studio Command Bar (View > Command Bar)
+
+     A window opens straight away. The bar across the top tells you whether it
+     can actually read your code, and if not, exactly why.
+
+     TWO WAYS TO GET THE CODE OUT
+       "Open in Script Editor"  needs nothing else. Builds the dump into real
+                                ModuleScripts and opens them in Studio's own
+                                editor, where Ctrl+A / Ctrl+C works properly.
+       "Send to Browser"        needs  python3 dump.py  running first, plus
+                                Game Settings > Security > Allow HTTP Requests.
+
+     No -- line comments and semicolons everywhere, so this still runs even if
+     the Command Bar flattens the paste onto one line.
+     ========================================================================== ]]
+
+local PORT = 8080;
+local BATCH_CHARS = 150000;
+
+local HttpService = game:GetService("HttpService");
+local RunService = game:GetService("RunService");
+local ServerStorage = game:GetService("ServerStorage");
+
+local ROOTS = {
+	"Workspace", "Players", "Lighting", "ReplicatedFirst", "ReplicatedStorage",
+	"ServerScriptService", "ServerStorage", "StarterGui", "StarterPack",
+	"StarterPlayer", "SoundService", "Teams", "Chat", "TextChatService",
+	"MaterialService", "TestService",
+};
+
+local COLORS = {
+	Script = Color3.fromRGB(76, 154, 255),
+	LocalScript = Color3.fromRGB(91, 217, 154),
+	ModuleScript = Color3.fromRGB(242, 180, 65),
+};
+
+local BG = Color3.fromRGB(11, 15, 26);
+local PANEL = Color3.fromRGB(19, 26, 42);
+local PANEL2 = Color3.fromRGB(26, 35, 54);
+local RULE = Color3.fromRGB(34, 48, 71);
+local TEXT = Color3.fromRGB(220, 227, 240);
+local MUTE = Color3.fromRGB(107, 122, 153);
+local ACCENT = Color3.fromRGB(76, 154, 255);
+local GOOD = Color3.fromRGB(91, 217, 154);
+local BAD = Color3.fromRGB(255, 107, 122);
+
+--[[ ---------- helpers ---------- ]]
+
+local function make(class, props, kids)
+	local o = Instance.new(class);
+	for k, v in pairs(props) do
+		if k ~= "Parent" then o[k] = v; end
+	end
+	for _, kid in ipairs(kids or {}) do kid.Parent = o; end
+	if props.Parent then o.Parent = props.Parent; end
+	return o;
+end
+
+local function round(r)
+	return make("UICorner", {CornerRadius = UDim.new(0, r or 6)});
+end
+
+--[[ ---------- scan ---------- ]]
+
+local allScripts = {};
+local readable = 0;
+
+local function scan()
+	allScripts = {};
+	readable = 0;
+
+	for _, serviceName in ipairs(ROOTS) do
+		local hasService, service = pcall(game.GetService, game, serviceName);
+		if hasService and service then
+			local hasKids, kids = pcall(service.GetDescendants, service);
+			if hasKids then
+				for _, item in ipairs(kids) do
+					local skip = false;
+					local dumpFolder = ServerStorage:FindFirstChild("ScriptDump");
+					if dumpFolder and item:IsDescendantOf(dumpFolder) then skip = true; end
+
+					if item:IsA("LuaSourceContainer") and not skip then
+						local gotIt, source = pcall(function() return item.Source; end);
+						local isOk = gotIt and type(source) == "string";
+						if isOk then
+							readable = readable + 1;
+						else
+							source = "";
+						end
+						local _, breaks = string.gsub(source, "\n", "");
+						table.insert(allScripts, {
+							path = string.gsub(item:GetFullName(), "^game%.", ""),
+							name = item.Name,
+							class = item.ClassName,
+							lines = (source == "") and 0 or (breaks + 1),
+							chars = #source,
+							source = source,
+							ok = isOk,
+						});
+					end
+				end
+			end
+		end
+	end
+
+	table.sort(allScripts, function(a, b)
+		return string.lower(a.path) < string.lower(b.path);
+	end);
+end
+
+scan();
+
+--[[ ---------- window ---------- ]]
+
+local host = game:GetService("CoreGui");
+local previous = host:FindFirstChild("ScriptDumpMenu");
+if previous then previous:Destroy(); end
+
+local screen = make("ScreenGui", {
+	Name = "ScriptDumpMenu",
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 9999,
+	Parent = host,
+});
+
+local win = make("Frame", {
+	Size = UDim2.fromOffset(1000, 640),
+	Position = UDim2.new(0.5, -500, 0.5, -320),
+	BackgroundColor3 = BG,
+	BorderSizePixel = 0,
+	Parent = screen,
+}, {round(10)});
+
+local title = make("Frame", {
+	Size = UDim2.new(1, 0, 0, 38),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	Parent = win,
+}, {round(10)});
+
+make("Frame", {
+	Size = UDim2.new(1, 0, 0, 12),
+	Position = UDim2.new(0, 0, 1, -12),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	Parent = title,
+});
+
+make("TextLabel", {
+	Size = UDim2.new(1, -50, 1, 0),
+	Position = UDim2.fromOffset(14, 0),
+	BackgroundTransparency = 1,
+	Text = "Script Dump",
+	TextColor3 = TEXT,
+	TextSize = 15,
+	Font = Enum.Font.GothamBold,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = title,
+});
+
+local closeBtn = make("TextButton", {
+	Size = UDim2.fromOffset(26, 26),
+	Position = UDim2.new(1, -32, 0, 6),
+	BackgroundColor3 = PANEL2,
+	Text = "X",
+	TextColor3 = MUTE,
+	TextSize = 12,
+	Font = Enum.Font.GothamBold,
+	Parent = title,
+}, {round(5)});
+
+closeBtn.MouseButton1Click:Connect(function() screen:Destroy(); end);
+
+do
+	local dragging, startAt, startPos = false, nil, nil;
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true; startAt = input.Position; startPos = win.Position;
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false; end
+			end);
+		end
+	end);
+	game:GetService("UserInputService").InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+			local d = input.Position - startAt;
+			win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y);
+		end
+	end);
+end
+
+--[[ ---------- the diagnosis banner, front and centre ---------- ]]
+
+local banner = make("Frame", {
+	Size = UDim2.new(1, -20, 0, 52),
+	Position = UDim2.fromOffset(10, 46),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	Parent = win,
+}, {round(7)});
+
+local bannerBar = make("Frame", {
+	Size = UDim2.new(0, 4, 1, -14),
+	Position = UDim2.fromOffset(0, 7),
+	BackgroundColor3 = GOOD,
+	BorderSizePixel = 0,
+	Parent = banner,
+}, {round(2)});
+
+local bannerTitle = make("TextLabel", {
+	Size = UDim2.new(1, -20, 0, 18),
+	Position = UDim2.fromOffset(14, 8),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = GOOD,
+	TextSize = 14,
+	Font = Enum.Font.GothamBold,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = banner,
+});
+
+local bannerBody = make("TextLabel", {
+	Size = UDim2.new(1, -20, 0, 16),
+	Position = UDim2.fromOffset(14, 27),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = MUTE,
+	TextSize = 12,
+	Font = Enum.Font.Gotham,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = banner,
+});
+
+local function refreshBanner()
+	local isEdit = RunService:IsEdit();
+
+	if not isEdit then
+		bannerBar.BackgroundColor3 = BAD;
+		bannerTitle.TextColor3 = BAD;
+		bannerTitle.Text = "PLAY MODE  --  this is why your code is empty";
+		bannerBody.Text = "Press the Stop button, then paste this again in Edit mode. "
+			.. "The client cannot read Source or use HttpService.";
+	elseif readable == 0 and #allScripts > 0 then
+		bannerBar.BackgroundColor3 = BAD;
+		bannerTitle.TextColor3 = BAD;
+		bannerTitle.Text = "NO SOURCE ACCESS  --  " .. #allScripts .. " scripts found, 0 readable";
+		bannerBody.Text = "Paste this into the Command Bar, not into a Script. "
+			.. "Scripts you press Play on can never read Source.";
+	else
+		bannerBar.BackgroundColor3 = GOOD;
+		bannerTitle.TextColor3 = GOOD;
+		bannerTitle.Text = "EDIT MODE  --  " .. readable .. " of " .. #allScripts .. " scripts readable";
+		bannerBody.Text = "Use Open in Script Editor to copy everything, "
+			.. "or Send to Browser if dump.py is running.";
+	end
+end
+
+--[[ ---------- list and code panes ---------- ]]
+
+local listPane = make("Frame", {
+	Size = UDim2.new(0, 330, 1, -160),
+	Position = UDim2.fromOffset(10, 106),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	Parent = win,
+}, {round(7)});
+
+local searchBox = make("TextBox", {
+	Size = UDim2.new(1, -16, 0, 28),
+	Position = UDim2.fromOffset(8, 8),
+	BackgroundColor3 = BG,
+	BorderSizePixel = 0,
+	Text = "",
+	PlaceholderText = "filter",
+	PlaceholderColor3 = Color3.fromRGB(61, 74, 99),
+	TextColor3 = TEXT,
+	TextSize = 12,
+	Font = Enum.Font.Code,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ClearTextOnFocus = false,
+	Parent = listPane,
+}, {round(5), make("UIPadding", {PaddingLeft = UDim.new(0, 8)})});
+
+local listScroll = make("ScrollingFrame", {
+	Size = UDim2.new(1, -16, 1, -44),
+	Position = UDim2.fromOffset(8, 42),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 5,
+	ScrollBarImageColor3 = RULE,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	Parent = listPane,
+}, {make("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder})});
+
+local codePane = make("Frame", {
+	Size = UDim2.new(1, -360, 1, -160),
+	Position = UDim2.fromOffset(350, 106),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	Parent = win,
+}, {round(7)});
+
+local pathLabel = make("TextLabel", {
+	Size = UDim2.new(1, -16, 0, 26),
+	Position = UDim2.fromOffset(8, 6),
+	BackgroundTransparency = 1,
+	Text = "Pick a script on the left",
+	TextColor3 = MUTE,
+	TextSize = 12,
+	Font = Enum.Font.Code,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = codePane,
+});
+
+local codeScroll = make("ScrollingFrame", {
+	Size = UDim2.new(1, -16, 1, -42),
+	Position = UDim2.fromOffset(8, 34),
+	BackgroundColor3 = BG,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 6,
+	ScrollBarImageColor3 = RULE,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.XY,
+	Parent = codePane,
+}, {round(5)});
+
+local codeBox = make("TextBox", {
+	Size = UDim2.new(1, -16, 0, 0),
+	Position = UDim2.fromOffset(8, 8),
+	AutomaticSize = Enum.AutomaticSize.XY,
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = TEXT,
+	TextSize = 12,
+	Font = Enum.Font.Code,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	MultiLine = true,
+	ClearTextOnFocus = false,
+	TextWrapped = false,
+	Parent = codeScroll,
+});
+
+--[[ ---------- buttons ---------- ]]
+
+local bar = make("Frame", {
+	Size = UDim2.new(1, -20, 0, 34),
+	Position = UDim2.new(0, 10, 1, -44),
+	BackgroundTransparency = 1,
+	Parent = win,
+});
+
+local function makeBtn(text, width, x, bg, fg)
+	return make("TextButton", {
+		Size = UDim2.fromOffset(width, 34),
+		Position = UDim2.fromOffset(x, 0),
+		BackgroundColor3 = bg or PANEL2,
+		BorderSizePixel = 0,
+		Text = text,
+		TextColor3 = fg or TEXT,
+		TextSize = 12,
+		Font = Enum.Font.GothamMedium,
+		Parent = bar,
+	}, {round(5)});
+end
+
+local editorBtn = makeBtn("Open in Script Editor", 170, 0, ACCENT, Color3.fromRGB(12, 16, 24));
+local browserBtn = makeBtn("Send to Browser", 140, 180);
+local rescanBtn = makeBtn("Rescan", 80, 330);
+
+local statusLabel = make("TextLabel", {
+	Size = UDim2.new(1, -430, 1, 0),
+	Position = UDim2.fromOffset(422, 0),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = MUTE,
+	TextSize = 12,
+	Font = Enum.Font.Gotham,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextWrapped = true,
+	Parent = bar,
+});
+
+local function say(text, color)
+	statusLabel.Text = text;
+	statusLabel.TextColor3 = color or MUTE;
+	print("[dump] " .. text);
+end
+
+--[[ ---------- list rendering ---------- ]]
+
+local current = nil;
+local rows = {};
+
+local function show(entry)
+	current = entry;
+	for _, r in ipairs(rows) do
+		r.BackgroundColor3 = (r:GetAttribute("p") == entry.path) and PANEL2 or PANEL;
+	end
+	pathLabel.Text = entry.path .. "   [" .. entry.class .. "]   " .. entry.lines .. " lines";
+	pathLabel.TextColor3 = COLORS[entry.class] or TEXT;
+	if entry.ok then
+		codeBox.Text = entry.source;
+	else
+		codeBox.Text = "This script's source could not be read.\n\n"
+			.. "See the banner at the top of this window for the reason.";
+	end
+	codeScroll.CanvasPosition = Vector2.zero;
+end
+
+local function renderList()
+	for _, child in ipairs(listScroll:GetChildren()) do
+		if child:IsA("TextButton") then child:Destroy(); end
+	end
+	rows = {};
+
+	local filter = string.lower(searchBox.Text);
+	local count = 0;
+
+	for i, entry in ipairs(allScripts) do
+		local hay = string.lower(entry.path .. " " .. entry.class);
+		if filter == "" or string.find(hay, filter, 1, true) then
+			count = count + 1;
+			local row = make("TextButton", {
+				Size = UDim2.new(1, -6, 0, 38),
+				BackgroundColor3 = PANEL,
+				BorderSizePixel = 0,
+				Text = "",
+				AutoButtonColor = false,
+				LayoutOrder = i,
+				Parent = listScroll,
+			}, {round(5)});
+			row:SetAttribute("p", entry.path);
+
+			make("Frame", {
+				Size = UDim2.new(0, 3, 1, -10),
+				Position = UDim2.fromOffset(0, 5),
+				BackgroundColor3 = COLORS[entry.class] or MUTE,
+				BorderSizePixel = 0,
+				Parent = row,
+			});
+
+			make("TextLabel", {
+				Size = UDim2.new(1, -16, 0, 15),
+				Position = UDim2.fromOffset(10, 4),
+				BackgroundTransparency = 1,
+				Text = entry.name,
+				TextColor3 = entry.ok and TEXT or BAD,
+				TextSize = 12,
+				Font = Enum.Font.GothamMedium,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = row,
+			});
+
+			make("TextLabel", {
+				Size = UDim2.new(1, -16, 0, 13),
+				Position = UDim2.fromOffset(10, 20),
+				BackgroundTransparency = 1,
+				Text = entry.path,
+				TextColor3 = MUTE,
+				TextSize = 10,
+				Font = Enum.Font.Code,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = row,
+			});
+
+			row.MouseButton1Click:Connect(function() show(entry); end);
+			table.insert(rows, row);
+		end
+	end
+	return count;
+end
+
+--[[ ---------- export into Studio's own editor ---------- ]]
+
+local function exportToEditor()
+	if readable == 0 then
+		say("Nothing readable to export. Fix the problem in the banner first.", BAD);
+		return;
+	end
+
+	local old = ServerStorage:FindFirstChild("ScriptDump");
+	if old then old:Destroy(); end
+
+	local folder = make("Folder", {Name = "ScriptDump", Parent = ServerStorage});
+
+	local bar78 = string.rep("=", 78);
+	local pieces = {};
+	local count = 0;
+	for _, entry in ipairs(allScripts) do
+		if entry.ok then
+			table.insert(pieces, bar78 .. "\n" .. entry.path .. "  [" .. entry.class
+				.. "]  " .. entry.lines .. " lines\n" .. bar78 .. "\n" .. entry.source);
+			count = count + 1;
+		end
+	end
+	local dump = table.concat(pieces, "\n\n");
+
+	local made = {};
+	local pos = 1;
+	local index = 0;
+	while pos <= #dump do
+		index = index + 1;
+		local stop = math.min(pos + 180000, #dump);
+		if stop < #dump then
+			local nl = string.find(dump, "\n", stop, true);
+			if nl then stop = nl; end
+		end
+		local m = make("ModuleScript", {
+			Name = (index == 1 and #dump <= 180000) and "Dump" or ("Dump_Part" .. index),
+			Parent = folder,
+		});
+		local wrote = pcall(function()
+			m.Source = "--[==[\n" .. string.sub(dump, pos, stop) .. "\n]==]";
+		end);
+		if not wrote then m.Source = "-- could not write this chunk"; end
+		table.insert(made, m);
+		pos = stop + 1;
+	end
+
+	pcall(function() game:GetService("Selection"):Set(made); end);
+
+	local editor = game:FindService("ScriptEditorService");
+	if editor then
+		task.spawn(function()
+			for _, m in ipairs(made) do
+				pcall(function() editor:OpenScriptDocumentAsync(m); end);
+			end
+		end);
+	end
+
+	say(count .. " scripts written to ServerStorage.ScriptDump ("
+		.. #made .. " part(s)). Click the editor tab, then Ctrl+A, Ctrl+C.", GOOD);
+end
+
+--[[ ---------- send to the browser viewer ---------- ]]
+
+local function sendToBrowser()
+	if not RunService:IsEdit() then
+		say("Can't send from Play mode. Press Stop first.", BAD);
+		return;
+	end
+	if readable == 0 then
+		say("Nothing readable to send.", BAD);
+		return;
+	end
+
+	local url = "http://localhost:" .. PORT .. "/api/upload";
+	local session = string.format("%d_%d", os.time(), math.random(1000, 9999));
+	local batch = {};
+	local chars = 0;
+	local part = 0;
+	local sent = 0;
+
+	for i, entry in ipairs(allScripts) do
+		table.insert(batch, entry);
+		chars = chars + entry.chars + 200;
+
+		if chars >= BATCH_CHARS or i == #allScripts then
+			part = part + 1;
+			local body = HttpService:JSONEncode({
+				session = session, place = game.Name, placeId = game.PlaceId,
+				part = part, final = (i == #allScripts), total = #allScripts,
+				scripts = batch,
+			});
+
+			local posted, err = pcall(function()
+				return HttpService:PostAsync(url, body, Enum.HttpContentType.ApplicationJson, false);
+			end);
+
+			if not posted then
+				local msg = tostring(err);
+				if string.find(msg, "ConnectFail") or string.find(msg, "Timedout") or string.find(msg, "curl") then
+					say("Can't reach " .. url .. " -- run  python3 dump.py  first.", BAD);
+				elseif string.find(msg, "not enabled") or string.find(msg, "Http requests") then
+					say("Turn on Game Settings > Security > Allow HTTP Requests.", BAD);
+				else
+					say("Send failed: " .. msg .. "  -- use Open in Script Editor instead.", BAD);
+				end
+				return;
+			end
+
+			sent = sent + #batch;
+			batch = {};
+			chars = 0;
+		end
+	end
+
+	say("Sent " .. sent .. " scripts. Open http://localhost:" .. PORT, GOOD);
+end
+
+--[[ ---------- wire it up ---------- ]]
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(renderList);
+editorBtn.MouseButton1Click:Connect(exportToEditor);
+browserBtn.MouseButton1Click:Connect(sendToBrowser);
+
+rescanBtn.MouseButton1Click:Connect(function()
+	scan();
+	renderList();
+	refreshBanner();
+	say(#allScripts .. " scripts, " .. readable .. " readable.");
+end);
+
+renderList();
+refreshBanner();
+say(#allScripts .. " scripts found, " .. readable .. " readable.");
+
+if #allScripts > 0 then
+	for _, entry in ipairs(allScripts) do
+		if entry.ok then show(entry); break; end
+	end
+end
