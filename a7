@@ -1,0 +1,339 @@
+--[[
+	SecurityTests.server.lua
+	Drop into ServerScriptService, press Play, read Output.
+
+	Contains three things:
+	  1. A deliberately vulnerable SellItem, for contrast
+	  2. A hardened SellItem and RedeemCode
+	  3. A test suite that runs against both
+
+	The suite is expected to FAIL on the vulnerable version. That is the point --
+	a test that passes on broken code proves nothing. Run it, watch the vulnerable
+	column fail, then swap in your real handler and see which column it matches.
+
+	No DataStores, no remotes, no Players -- everything is simulated so it runs
+	instantly and deterministically in Studio.
+--]]
+
+--------------------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------------------
+
+local REDEEM_MIN_INTERVAL = 1.0   -- seconds between attempts
+local REDEEM_WINDOW       = 60.0  -- sliding window length
+local REDEEM_MAX_ATTEMPTS = 5     -- attempts allowed per window
+local MAX_CODE_LENGTH     = 32
+
+local VALID_CODES = {
+	["LAUNCH"]  = { money = 1000 },
+	["THANKS"]  = { money = 500 },
+}
+
+--------------------------------------------------------------------------------
+-- SIMULATED WORLD
+--------------------------------------------------------------------------------
+
+local function newWorld()
+	return {
+		clock     = 0,     -- test-controlled time; avoids real waiting
+		inventory = {},    -- [userId] = { [uid] = {name=, value=} }
+		money     = {},    -- [userId] = number
+		redeemed  = {},    -- [userId] = { [CODE] = true }
+		rate      = {},    -- [userId] = { last=, windowStart=, attempts= }
+	}
+end
+
+local function giveItem(world, userId, uid, value)
+	world.inventory[userId] = world.inventory[userId] or {}
+	world.inventory[userId][uid] = { name = uid, value = value }
+	world.money[userId] = world.money[userId] or 0
+end
+
+--------------------------------------------------------------------------------
+-- VULNERABLE SellItem  (what the bug looks like)
+--------------------------------------------------------------------------------
+
+-- The flaw: it credits money and only THEN removes the item, with a yield in
+-- between. Two overlapping fires both read the item as present.
+local function sell_vulnerable(world, userId, uid, yieldHook)
+	local inv = world.inventory[userId]
+	if not inv then return end
+
+	local item = inv[uid]
+	if not item then return end
+
+	local value = item.value
+
+	if yieldHook then yieldHook() end   -- stands in for a DataStore/WaitForChild call
+
+	world.money[userId] = (world.money[userId] or 0) + value
+	inv[uid] = nil                       -- claimed too late
+end
+
+--------------------------------------------------------------------------------
+-- HARDENED SellItem
+--------------------------------------------------------------------------------
+
+-- The fix: claim the item (remove it) before anything that can yield. A second
+-- fire arrives to find nothing there and returns immediately.
+local function sell_hardened(world, userId, uid, yieldHook)
+	-- 1. type gate -- exploiters pass tables, nil, numbers, NaN
+	if type(uid) ~= "string" then return end
+	if #uid == 0 or #uid > 64 then return end
+
+	-- 2. ownership -- read from the CALLER's inventory only
+	local inv = world.inventory[userId]
+	if not inv then return end
+
+	local item = inv[uid]
+	if not item then return end
+
+	-- 3. claim atomically. No yield may appear between the check above and this
+	--    line. This is the whole fix.
+	inv[uid] = nil
+
+	local value = item.value
+	if type(value) ~= "number" or value ~= value or value < 0 then return end
+
+	-- 4. now it is safe to yield
+	if yieldHook then yieldHook() end
+
+	world.money[userId] = (world.money[userId] or 0) + value
+end
+
+--------------------------------------------------------------------------------
+-- HARDENED RedeemCode
+--------------------------------------------------------------------------------
+
+local function redeem_hardened(world, userId, code)
+	-- 1. type + length gate before any lookup work
+	if type(code) ~= "string" then return false, "Invalid code." end
+	if #code == 0 or #code > MAX_CODE_LENGTH then return false, "Invalid code." end
+
+	code = string.upper(code)
+
+	local st = world.rate[userId]
+	if not st then
+		st = { last = -math.huge, windowStart = world.clock, attempts = 0 }
+		world.rate[userId] = st
+	end
+
+	local now = world.clock
+
+	-- 2. throttle BEFORE validity is checked, so brute force is bounded
+	--    regardless of whether the guess was close
+	if now - st.last < REDEEM_MIN_INTERVAL then
+		return false, "Please wait before trying again."
+	end
+	st.last = now
+
+	if now - st.windowStart > REDEEM_WINDOW then
+		st.windowStart = now
+		st.attempts = 0
+	end
+
+	st.attempts += 1
+	if st.attempts > REDEEM_MAX_ATTEMPTS then
+		return false, "Too many attempts. Try again later."
+	end
+
+	-- 3. identical response for "no such code" and "already used" -- otherwise
+	--    the error message tells an attacker which guesses were real codes
+	local reward = VALID_CODES[code]
+	if not reward then return false, "Invalid code." end
+
+	world.redeemed[userId] = world.redeemed[userId] or {}
+	if world.redeemed[userId][code] then return false, "Invalid code." end
+
+	world.redeemed[userId][code] = true
+	world.money[userId] = (world.money[userId] or 0) + reward.money
+	return true, "Redeemed!"
+end
+
+--------------------------------------------------------------------------------
+-- TEST RUNNER
+--------------------------------------------------------------------------------
+
+local results = {}
+
+local function check(name, actual, expected)
+	local ok = actual == expected
+	table.insert(results, {
+		name = name,
+		ok = ok,
+		detail = ok and "" or string.format("got %s, expected %s",
+			tostring(actual), tostring(expected)),
+	})
+end
+
+--------------------------------------------------------------------------------
+-- SELL TESTS
+--------------------------------------------------------------------------------
+
+-- The important one. Two fires interleaved at the yield point, which is exactly
+-- what two rapid client fires look like when the handler touches a DataStore.
+local function test_interleavedFire(label, sellFn, fireCount)
+	local w = newWorld()
+	giveItem(w, 1, "item_a", 100)
+
+	local parked = {}
+	local hook = function()
+		table.insert(parked, coroutine.running())
+		coroutine.yield()
+	end
+
+	local threads = {}
+	for _ = 1, fireCount do
+		local co = coroutine.create(function() sellFn(w, 1, "item_a", hook) end)
+		table.insert(threads, co)
+	end
+
+	for _, co in ipairs(threads) do coroutine.resume(co) end   -- all run to the yield
+	for _, co in ipairs(parked) do coroutine.resume(co) end    -- then all complete
+
+	check(string.format("[%s] %d interleaved fires pay exactly once", label, fireCount),
+		w.money[1], 100)
+	check(string.format("[%s] item is gone after %d fires", label, fireCount),
+		w.inventory[1]["item_a"], nil)
+end
+
+local function test_sequentialFire(label, sellFn, fireCount)
+	local w = newWorld()
+	giveItem(w, 1, "item_a", 100)
+	for _ = 1, fireCount do sellFn(w, 1, "item_a", nil) end
+	check(string.format("[%s] %d sequential fires pay exactly once", label, fireCount),
+		w.money[1], 100)
+end
+
+local function test_sellTypes()
+	local w = newWorld()
+	giveItem(w, 1, "item_a", 100)
+	for _, bad in ipairs({ 42, true, {}, string.rep("x", 500) }) do
+		sell_hardened(w, 1, bad, nil)
+	end
+	sell_hardened(w, 1, nil, nil)
+	check("[hardened] malformed uid pays nothing", w.money[1], 0)
+	check("[hardened] malformed uid leaves item intact",
+		w.inventory[1]["item_a"] ~= nil, true)
+end
+
+local function test_crossPlayer()
+	local w = newWorld()
+	giveItem(w, 1, "victim_item", 5000)
+	giveItem(w, 2, "own_item", 10)
+	sell_hardened(w, 2, "victim_item", nil)   -- player 2 tries player 1's uid
+	check("[hardened] cannot sell another player's item", w.money[2], 0)
+	check("[hardened] victim keeps their item",
+		w.inventory[1]["victim_item"] ~= nil, true)
+end
+
+local function test_unknownItem()
+	local w = newWorld()
+	giveItem(w, 1, "item_a", 100)
+	sell_hardened(w, 1, "does_not_exist", nil)
+	check("[hardened] unknown uid pays nothing", w.money[1], 0)
+end
+
+--------------------------------------------------------------------------------
+-- REDEEM TESTS
+--------------------------------------------------------------------------------
+
+local function test_redeemOnce()
+	local w = newWorld()
+	w.money[1] = 0
+	local ok1 = redeem_hardened(w, 1, "LAUNCH")
+	w.clock += 2
+	local ok2 = redeem_hardened(w, 1, "LAUNCH")
+	check("[redeem] first use succeeds", ok1, true)
+	check("[redeem] second use rejected", ok2, false)
+	check("[redeem] paid exactly once", w.money[1], 1000)
+end
+
+local function test_redeemBruteForce()
+	local w = newWorld()
+	w.money[1] = 0
+	local accepted = 0
+	-- 200 guesses, all inside one window, no waiting
+	for i = 1, 200 do
+		local ok = redeem_hardened(w, 1, "GUESS" .. i)
+		if ok then accepted += 1 end
+		w.clock += REDEEM_MIN_INTERVAL   -- respects the interval, still hits the cap
+	end
+	local st = w.rate[1]
+	check("[redeem] brute force accepted nothing", accepted, 0)
+	check("[redeem] attempts capped within window", st.attempts <= REDEEM_MAX_ATTEMPTS + 1, true)
+end
+
+local function test_redeemThrottle()
+	local w = newWorld()
+	w.money[1] = 0
+	redeem_hardened(w, 1, "NOPE")
+	local ok, msg = redeem_hardened(w, 1, "NOPE")   -- no clock advance
+	check("[redeem] instant retry throttled", ok, false)
+	check("[redeem] throttle message differs from invalid",
+		msg ~= "Invalid code.", true)
+end
+
+local function test_redeemOracle()
+	local w = newWorld()
+	w.money[1] = 0
+	redeem_hardened(w, 1, "LAUNCH")            -- consume a real code
+	w.clock += 2
+	local _, usedMsg = redeem_hardened(w, 1, "LAUNCH")
+	w.clock += 2
+	local _, fakeMsg = redeem_hardened(w, 1, "ZZZZZZ")
+	check("[redeem] used code and fake code respond identically",
+		usedMsg, fakeMsg)
+end
+
+local function test_redeemTypes()
+	local w = newWorld()
+	w.money[1] = 0
+	for _, bad in ipairs({ 42, true, {}, string.rep("A", 5000) }) do
+		w.clock += 2
+		redeem_hardened(w, 1, bad)
+	end
+	check("[redeem] malformed input pays nothing", w.money[1], 0)
+end
+
+--------------------------------------------------------------------------------
+-- RUN
+--------------------------------------------------------------------------------
+
+print("\n================ SELL: VULNERABLE (expected to fail) ================")
+test_sequentialFire("vulnerable", sell_vulnerable, 20)
+test_interleavedFire("vulnerable", sell_vulnerable, 5)
+
+print("================ SELL: HARDENED ================")
+test_sequentialFire("hardened", sell_hardened, 20)
+test_interleavedFire("hardened", sell_hardened, 5)
+test_interleavedFire("hardened", sell_hardened, 50)
+test_sellTypes()
+test_crossPlayer()
+test_unknownItem()
+
+print("================ REDEEM ================")
+test_redeemOnce()
+test_redeemBruteForce()
+test_redeemThrottle()
+test_redeemOracle()
+test_redeemTypes()
+
+--------------------------------------------------------------------------------
+-- REPORT
+--------------------------------------------------------------------------------
+
+local passed, failed = 0, 0
+print("\n---------------- RESULTS ----------------")
+for _, r in ipairs(results) do
+	if r.ok then
+		passed += 1
+		print(string.format("  PASS  %s", r.name))
+	else
+		failed += 1
+		print(string.format("  FAIL  %s  --  %s", r.name, r.detail))
+	end
+end
+
+print(string.format("\n%d passed, %d failed", passed, failed))
+print("Expected: the 3 [vulnerable] failures. Any [hardened] or [redeem] failure is a real problem.\n")
