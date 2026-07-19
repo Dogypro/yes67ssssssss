@@ -1,0 +1,141 @@
+--[[ ==========================================================================
+     ROBLOX SCRIPT DUMP  --  paste this into the Studio Command Bar
+
+     STEPS
+       1. python3 dump.py                        (your browser opens by itself)
+       2. File > Game Settings > Security > Allow HTTP Requests = ON
+       3. Be in EDIT mode. If the Stop button is lit, press it first.
+       4. View > Command Bar
+       5. Select ALL of this file, paste it in, press Enter
+       6. Watch View > Output
+
+     If you changed the port, change PORT below to match.
+
+     NOTE ON FORMATTING
+       There are no -- line comments in this file and every statement ends in a
+       semicolon. The Command Bar sometimes flattens a paste onto one line, and
+       a single -- comment would then swallow the rest of the script and it
+       would silently do nothing. Block comments like this one survive it.
+     ========================================================================== ]]
+
+local PORT = 8080;
+local BATCH_CHARS = 150000;
+
+local URL = "http://localhost:" .. PORT .. "/api/upload";
+local HttpService = game:GetService("HttpService");
+
+local ROOTS = {
+	"Workspace", "Players", "Lighting", "ReplicatedFirst", "ReplicatedStorage",
+	"ServerScriptService", "ServerStorage", "StarterGui", "StarterPack",
+	"StarterPlayer", "SoundService", "Teams", "Chat", "TextChatService",
+	"MaterialService", "TestService",
+};
+
+--[[ ---------- 1. collect every script in the place ---------- ]]
+
+local found = {};
+local readable = 0;
+
+for _, serviceName in ipairs(ROOTS) do
+	local hasService, service = pcall(game.GetService, game, serviceName);
+	if hasService and service then
+		local hasKids, kids = pcall(service.GetDescendants, service);
+		if hasKids then
+			for _, item in ipairs(kids) do
+				if item:IsA("LuaSourceContainer") then
+					local gotSource, source = pcall(function() return item.Source; end);
+					local isOk = gotSource and type(source) == "string";
+					if isOk then
+						readable = readable + 1;
+					else
+						source = "-- unreadable: " .. tostring(source);
+					end
+					local path = string.gsub(item:GetFullName(), "^game%.", "");
+					local _, breaks = string.gsub(source, "\n", "");
+					table.insert(found, {
+						path = path,
+						name = item.Name,
+						class = item.ClassName,
+						lines = breaks + 1,
+						chars = #source,
+						source = source,
+						ok = isOk,
+					});
+				end
+			end
+		end
+	end
+end
+
+table.sort(found, function(a, b) return string.lower(a.path) < string.lower(b.path); end);
+
+print(string.format("[dump] %d scripts found, %d readable", #found, readable));
+
+--[[ ---------- 2. stop early if something is obviously wrong ---------- ]]
+
+if #found == 0 then
+	warn("[dump] Nothing found. Is a place open in Studio?");
+	return;
+end
+
+if readable == 0 then
+	warn("[dump] ----------------------------------------------------------");
+	warn("[dump] Found scripts but could not read any of their code.");
+	warn("[dump] Reading Source needs Command Bar permission. So:");
+	warn("[dump]   * paste into the COMMAND BAR, not into a Script");
+	warn("[dump]   * press Stop and go back to EDIT mode if the game is running");
+	warn("[dump] ----------------------------------------------------------");
+	return;
+end
+
+--[[ ---------- 3. send it over in batches ---------- ]]
+
+local session = string.format("%d_%d", os.time(), math.random(1000, 9999));
+local batch = {};
+local batchChars = 0;
+local part = 0;
+local sent = 0;
+
+for i, item in ipairs(found) do
+	table.insert(batch, item);
+	batchChars = batchChars + item.chars + 200;
+
+	if batchChars >= BATCH_CHARS or i == #found then
+		part = part + 1;
+
+		local body = HttpService:JSONEncode({
+			session = session,
+			place = game.Name,
+			placeId = game.PlaceId,
+			part = part,
+			final = (i == #found),
+			total = #found,
+			scripts = batch,
+		});
+
+		local posted, err = pcall(function()
+			return HttpService:PostAsync(URL, body, Enum.HttpContentType.ApplicationJson, false);
+		end);
+
+		if not posted then
+			local msg = tostring(err);
+			warn(string.format("[dump] Part %d failed: %s", part, msg));
+			if string.find(msg, "ConnectFail") or string.find(msg, "Timedout") or string.find(msg, "curl") then
+				warn("[dump] Cannot reach " .. URL);
+				warn("[dump] Start it first:  python3 dump.py");
+			elseif string.find(msg, "not enabled") or string.find(msg, "Http requests") then
+				warn("[dump] Turn on File > Game Settings > Security > Allow HTTP Requests.");
+			elseif string.find(msg, "blocked") or string.find(msg, "cannot call") then
+				warn("[dump] Permission denied. This must go in the COMMAND BAR in Edit mode.");
+			end
+			return;
+		end
+
+		sent = sent + #batch;
+		print(string.format("[dump] sent %d / %d", sent, #found));
+		batch = {};
+		batchChars = 0;
+	end
+end
+
+print(string.format("[dump] Done. Open http://localhost:%d", PORT));
