@@ -1,0 +1,495 @@
+--[[ ==========================================================================
+     GAME DUMP  --  for Delta / mobile executors
+
+     Saves everything readable about the game to local files on your device.
+
+     OUTPUT  (in your executor's workspace folder)
+       GameDump/tree.txt       full instance hierarchy with properties
+       GameDump/remotes.txt    every RemoteEvent / RemoteFunction and its path
+       GameDump/modules.txt    live data returned by every ModuleScript
+       GameDump/scripts.txt    any script source that is actually readable
+       GameDump/summary.txt    counts and an index
+
+     WHY THERE IS NO SOURCE CODE
+       Roblox strips Source from scripts before they reach a client. It is not
+       a permission you can raise -- the text is simply not sent to your device.
+       Delta has no decompiler, so nothing can recover it client side.
+
+       What DOES work is require(). Requiring a ModuleScript gives you the real
+       table it returns: configs, item lists, stats, prices, tuning values. For
+       your own game that is usually the part you actually wanted.
+
+       If you need true source for your own game, open the place in Studio --
+       Source is fully readable there.
+     ========================================================================== ]]
+
+local CONFIG = {
+	Folder = "GameDump",
+	MaxDepth = 25,
+	MaxChildren = 4000,
+	MaxTableDepth = 6,
+	RequireTimeout = 2,
+	YieldEvery = 400,
+	Webhook = "https://discord.com/api/webhooks/1528360652324733039/E2Svhs-M3mLpn-Lz-0r_B8QjVrd0ij3eeksf6LG6pYgknlEWycMwD5J9B6zqnmRgaVk0",
+};
+
+--[[ ---------- feature detection, nothing is assumed ---------- ]]
+
+local canWrite = typeof(writefile) == "function";
+local canFolder = typeof(makefolder) == "function";
+local canClip = typeof(setclipboard) == "function";
+local httpPost = (syn and syn.request) or (http and http.request) or http_request or request;
+local guiHost = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui");
+
+local Players = game:GetService("Players");
+
+local ROOTS = {
+	"ReplicatedStorage", "ReplicatedFirst", "Workspace", "Lighting",
+	"StarterGui", "StarterPack", "StarterPlayer", "SoundService",
+	"Teams", "MaterialService",
+};
+
+local PROPS = {
+	Part = {"Size", "Position", "Anchored", "CanCollide", "Transparency", "Material", "BrickColor"},
+	MeshPart = {"Size", "Position", "Anchored", "MeshId", "TextureID"},
+	Model = {"PrimaryPart"},
+	Sound = {"SoundId", "Volume", "Looped", "Playing"},
+	Decal = {"Texture", "Transparency"},
+	Texture = {"Texture", "Transparency"},
+	StringValue = {"Value"},
+	IntValue = {"Value"},
+	NumberValue = {"Value"},
+	BoolValue = {"Value"},
+	ObjectValue = {"Value"},
+	Color3Value = {"Value"},
+	Vector3Value = {"Value"},
+	Folder = {},
+	Tool = {"RequiresHandle", "CanBeDropped"},
+	Humanoid = {"MaxHealth", "WalkSpeed", "JumpPower"},
+	TextLabel = {"Text", "TextSize"},
+	TextButton = {"Text", "TextSize"},
+	ImageLabel = {"Image"},
+	ImageButton = {"Image"},
+};
+
+--[[ ---------- value serialisation ---------- ]]
+
+local function shortValue(v)
+	local t = typeof(v);
+	if t == "string" then
+		if #v > 300 then v = string.sub(v, 1, 300) .. "..."; end
+		return string.format("%q", v);
+	elseif t == "number" or t == "boolean" then
+		return tostring(v);
+	elseif t == "nil" then
+		return "nil";
+	elseif t == "Vector3" then
+		return string.format("Vector3(%.2f, %.2f, %.2f)", v.X, v.Y, v.Z);
+	elseif t == "Vector2" then
+		return string.format("Vector2(%.2f, %.2f)", v.X, v.Y);
+	elseif t == "CFrame" then
+		local p = v.Position;
+		return string.format("CFrame(%.2f, %.2f, %.2f)", p.X, p.Y, p.Z);
+	elseif t == "Color3" then
+		return string.format("Color3(%d, %d, %d)", v.R * 255, v.G * 255, v.B * 255);
+	elseif t == "UDim2" then
+		return string.format("UDim2(%.2f, %d, %.2f, %d)",
+			v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset);
+	elseif t == "EnumItem" then
+		return tostring(v);
+	elseif t == "Instance" then
+		return "<" .. v.ClassName .. " " .. v:GetFullName() .. ">";
+	elseif t == "function" then
+		return "<function>";
+	end
+	return "<" .. t .. ">";
+end
+
+local function serialize(value, depth, seen, out)
+	depth = depth or 0;
+	seen = seen or {};
+	out = out or {};
+
+	if type(value) ~= "table" then
+		table.insert(out, shortValue(value));
+		return out;
+	end
+
+	if seen[value] then
+		table.insert(out, "<cycle>");
+		return out;
+	end
+	if depth >= CONFIG.MaxTableDepth then
+		table.insert(out, "{...}");
+		return out;
+	end
+	seen[value] = true;
+
+	local pad = string.rep("  ", depth + 1);
+	local closePad = string.rep("  ", depth);
+	local keys = {};
+	for k in pairs(value) do table.insert(keys, k); end
+
+	if #keys == 0 then
+		table.insert(out, "{}");
+		seen[value] = nil;
+		return out;
+	end
+
+	table.sort(keys, function(a, b) return tostring(a) < tostring(b); end);
+	table.insert(out, "{\n");
+
+	for _, k in ipairs(keys) do
+		table.insert(out, pad .. "[" .. shortValue(k) .. "] = ");
+		local ok = pcall(function()
+			serialize(value[k], depth + 1, seen, out);
+		end);
+		if not ok then table.insert(out, "<error>"); end
+		table.insert(out, ",\n");
+	end
+
+	table.insert(out, closePad .. "}");
+	seen[value] = nil;
+	return out;
+end
+
+--[[ ---------- gui ---------- ]]
+
+local old = guiHost:FindFirstChild("GameDumpUI");
+if old then old:Destroy(); end
+
+local screen = Instance.new("ScreenGui");
+screen.Name = "GameDumpUI";
+screen.ResetOnSpawn = false;
+screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling;
+screen.DisplayOrder = 99999;
+screen.Parent = guiHost;
+
+local panel = Instance.new("Frame");
+panel.Size = UDim2.fromOffset(300, 250);
+panel.Position = UDim2.new(0.5, -150, 0.5, -125);
+panel.BackgroundColor3 = Color3.fromRGB(15, 19, 30);
+panel.BorderSizePixel = 0;
+panel.Active = true;
+panel.Draggable = true;
+panel.Parent = screen;
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12);
+
+local stroke = Instance.new("UIStroke", panel);
+stroke.Color = Color3.fromRGB(40, 54, 80);
+stroke.Thickness = 1;
+
+local header = Instance.new("TextLabel");
+header.Size = UDim2.new(1, 0, 0, 44);
+header.BackgroundTransparency = 1;
+header.Text = "Game Dump";
+header.TextColor3 = Color3.fromRGB(225, 232, 245);
+header.TextSize = 17;
+header.Font = Enum.Font.GothamBold;
+header.Parent = panel;
+
+local closeBtn = Instance.new("TextButton");
+closeBtn.Size = UDim2.fromOffset(34, 34);
+closeBtn.Position = UDim2.new(1, -40, 0, 5);
+closeBtn.BackgroundColor3 = Color3.fromRGB(28, 36, 54);
+closeBtn.Text = "X";
+closeBtn.TextColor3 = Color3.fromRGB(140, 155, 180);
+closeBtn.TextSize = 14;
+closeBtn.Font = Enum.Font.GothamBold;
+closeBtn.Parent = panel;
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8);
+closeBtn.MouseButton1Click:Connect(function() screen:Destroy(); end);
+
+local status = Instance.new("TextLabel");
+status.Size = UDim2.new(1, -24, 0, 74);
+status.Position = UDim2.fromOffset(12, 44);
+status.BackgroundTransparency = 1;
+status.Text = "Ready.";
+status.TextColor3 = Color3.fromRGB(130, 145, 172);
+status.TextSize = 12;
+status.Font = Enum.Font.Gotham;
+status.TextWrapped = true;
+status.TextYAlignment = Enum.TextYAlignment.Top;
+status.TextXAlignment = Enum.TextXAlignment.Left;
+status.Parent = panel;
+
+local function makeButton(text, y, color)
+	local b = Instance.new("TextButton");
+	b.Size = UDim2.new(1, -24, 0, 42);
+	b.Position = UDim2.fromOffset(12, y);
+	b.BackgroundColor3 = color or Color3.fromRGB(28, 36, 54);
+	b.BorderSizePixel = 0;
+	b.Text = text;
+	b.TextColor3 = color and Color3.fromRGB(10, 14, 22) or Color3.fromRGB(225, 232, 245);
+	b.TextSize = 14;
+	b.Font = Enum.Font.GothamBold;
+	b.Parent = panel;
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 9);
+	return b;
+end
+
+local dumpBtn = makeButton("Dump everything", 124, Color3.fromRGB(76, 154, 255));
+local copyBtn = makeButton("Copy summary", 174);
+
+local function say(text)
+	status.Text = text;
+	print("[dump] " .. text);
+end
+
+--[[ ---------- the dump ---------- ]]
+
+local counters = {instances = 0, scripts = 0, modules = 0, remotes = 0, sourced = 0};
+local summaryText = "";
+local running = false;
+
+local function dumpAll()
+	if running then return; end
+	running = true;
+	dumpBtn.Text = "Working...";
+	counters = {instances = 0, scripts = 0, modules = 0, remotes = 0, sourced = 0};
+
+	local treeLines = {};
+	local remoteLines = {};
+	local moduleLines = {};
+	local scriptLines = {};
+	local modulesToLoad = {};
+	local processed = 0;
+
+	local function walk(inst, depth)
+		if depth > CONFIG.MaxDepth then return; end
+
+		processed = processed + 1;
+		counters.instances = counters.instances + 1;
+
+		if processed % CONFIG.YieldEvery == 0 then
+			say("Scanning... " .. counters.instances .. " objects");
+			task.wait();
+		end
+
+		local pad = string.rep("  ", depth);
+		local line = pad .. inst.ClassName .. ' "' .. inst.Name .. '"';
+
+		local propList = PROPS[inst.ClassName];
+		if propList then
+			local bits = {};
+			for _, propName in ipairs(propList) do
+				local ok, v = pcall(function() return inst[propName]; end);
+				if ok and v ~= nil then
+					table.insert(bits, propName .. "=" .. shortValue(v));
+				end
+			end
+			if #bits > 0 then line = line .. "  [" .. table.concat(bits, ", ") .. "]"; end
+		end
+
+		table.insert(treeLines, line);
+
+		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction")
+			or inst:IsA("BindableEvent") or inst:IsA("BindableFunction") then
+			counters.remotes = counters.remotes + 1;
+			table.insert(remoteLines, inst.ClassName .. "  " .. inst:GetFullName());
+		end
+
+		if inst:IsA("LuaSourceContainer") then
+			counters.scripts = counters.scripts + 1;
+			local gotSource, source = pcall(function() return inst.Source; end);
+			if gotSource and type(source) == "string" and #source > 0 then
+				counters.sourced = counters.sourced + 1;
+				table.insert(scriptLines, string.rep("=", 70));
+				table.insert(scriptLines, inst:GetFullName() .. "  [" .. inst.ClassName .. "]");
+				table.insert(scriptLines, string.rep("=", 70));
+				table.insert(scriptLines, source);
+				table.insert(scriptLines, "");
+			end
+			if inst:IsA("ModuleScript") then
+				table.insert(modulesToLoad, inst);
+			end
+		end
+
+		local ok, kids = pcall(function() return inst:GetChildren(); end);
+		if ok then
+			local n = 0;
+			for _, kid in ipairs(kids) do
+				n = n + 1;
+				if n > CONFIG.MaxChildren then
+					table.insert(treeLines, pad .. "  ... truncated");
+					break;
+				end
+				pcall(walk, kid, depth + 1);
+			end
+		end
+	end
+
+	for _, rootName in ipairs(ROOTS) do
+		local ok, service = pcall(game.GetService, game, rootName);
+		if ok and service then
+			table.insert(treeLines, "");
+			table.insert(treeLines, string.rep("#", 70));
+			table.insert(treeLines, "# " .. rootName);
+			table.insert(treeLines, string.rep("#", 70));
+			pcall(walk, service, 0);
+		end
+	end
+
+	local lp = Players.LocalPlayer;
+	if lp then
+		local pg = lp:FindFirstChild("PlayerGui");
+		if pg then
+			table.insert(treeLines, "");
+			table.insert(treeLines, string.rep("#", 70));
+			table.insert(treeLines, "# PlayerGui");
+			table.insert(treeLines, string.rep("#", 70));
+			pcall(walk, pg, 0);
+		end
+	end
+
+	--[[ require each module to read its live data ]]
+
+	say("Reading " .. #modulesToLoad .. " modules...");
+	task.wait();
+
+	local function safeRequire(m)
+		local finished, value = false, nil;
+		task.spawn(function()
+			local ok, res = pcall(require, m);
+			value = ok and res or nil;
+			finished = true;
+		end);
+		local waited = 0;
+		while not finished and waited < CONFIG.RequireTimeout do
+			task.wait(0.05);
+			waited = waited + 0.05;
+		end
+		return value;
+	end
+
+	for i, m in ipairs(modulesToLoad) do
+		if i % 15 == 0 then
+			say("Modules " .. i .. " / " .. #modulesToLoad);
+			task.wait();
+		end
+
+		local value = safeRequire(m);
+		if value ~= nil then
+			counters.modules = counters.modules + 1;
+			table.insert(moduleLines, string.rep("=", 70));
+			table.insert(moduleLines, m:GetFullName());
+			table.insert(moduleLines, string.rep("=", 70));
+			local pieces = {};
+			pcall(function() serialize(value, 0, {}, pieces); end);
+			table.insert(moduleLines, table.concat(pieces));
+			table.insert(moduleLines, "");
+		end
+	end
+
+	--[[ write it out ]]
+
+	summaryText = table.concat({
+		"GAME DUMP  --  " .. game.Name,
+		"PlaceId  " .. tostring(game.PlaceId),
+		"JobId    " .. tostring(game.JobId),
+		"Time     " .. os.date("%Y-%m-%d %H:%M:%S"),
+		"",
+		"Objects        " .. counters.instances,
+		"Scripts        " .. counters.scripts,
+		"  with source  " .. counters.sourced,
+		"Modules read   " .. counters.modules,
+		"Remotes        " .. counters.remotes,
+		"",
+		(counters.sourced == 0)
+			and "No script source available. Roblox strips it client side and Delta has no decompiler. Module data below is the real content."
+			or  "Some source was readable and is in scripts.txt.",
+	}, "\n");
+
+	if not canWrite then
+		say("This executor has no writefile. Summary copied instead.");
+		if canClip then pcall(setclipboard, summaryText); end
+		dumpBtn.Text = "Dump everything";
+		running = false;
+		return;
+	end
+
+	if canFolder then pcall(makefolder, CONFIG.Folder); end
+
+	local files = {
+		{"summary.txt", summaryText},
+		{"tree.txt", table.concat(treeLines, "\n")},
+		{"remotes.txt", table.concat(remoteLines, "\n")},
+		{"modules.txt", table.concat(moduleLines, "\n")},
+		{"scripts.txt", table.concat(scriptLines, "\n")},
+	};
+
+	local written = 0;
+	for _, entry in ipairs(files) do
+		local name, body = entry[1], entry[2];
+		if #body > 0 then
+			--[[ split anything huge, mobile chokes on giant writes ]]
+			if #body > 4000000 then
+				local index, pos = 0, 1;
+				while pos <= #body do
+					index = index + 1;
+					local stop = math.min(pos + 4000000, #body);
+					local nl = string.find(body, "\n", stop, true);
+					if nl then stop = nl; end
+					local ok = pcall(writefile,
+						CONFIG.Folder .. "/" .. string.gsub(name, "%.txt", "") .. "_part" .. index .. ".txt",
+						string.sub(body, pos, stop));
+					if ok then written = written + 1; end
+					pos = stop + 1;
+					task.wait();
+				end
+			else
+				local ok = pcall(writefile, CONFIG.Folder .. "/" .. name, body);
+				if ok then written = written + 1; end
+			end
+		end
+		task.wait();
+	end
+
+	say("Saved " .. written .. " files to " .. CONFIG.Folder .. "/\n"
+		.. counters.instances .. " objects, " .. counters.modules .. " modules, "
+		.. counters.remotes .. " remotes.");
+
+	--[[ optional webhook, summary only, never the whole dump ]]
+
+	if CONFIG.Webhook ~= "" and httpPost then
+		local body = game:GetService("HttpService"):JSONEncode({
+			content = "```\n" .. string.sub(summaryText, 1, 1800) .. "\n```",
+		});
+		pcall(function()
+			httpPost({
+				Url = CONFIG.Webhook,
+				Method = "POST",
+				Headers = {["Content-Type"] = "application/json"},
+				Body = body,
+			});
+		end);
+	end
+
+	dumpBtn.Text = "Dump everything";
+	running = false;
+end
+
+dumpBtn.MouseButton1Click:Connect(function()
+	task.spawn(dumpAll);
+end);
+
+copyBtn.MouseButton1Click:Connect(function()
+	if summaryText == "" then
+		say("Run the dump first.");
+		return;
+	end
+	if canClip then
+		pcall(setclipboard, summaryText);
+		say("Summary copied to clipboard.");
+	else
+		say("No setclipboard in this executor.");
+	end
+end);
+
+say(table.concat({
+	"writefile: " .. (canWrite and "yes" or "NO"),
+	"clipboard: " .. (canClip and "yes" or "no"),
+	"http: " .. (httpPost and "yes" or "no"),
+	"",
+	"Tap Dump everything.",
+}, "\n"));
