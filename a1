@@ -1,0 +1,139 @@
+--[[
+	SEND SCRIPTS TO VIEWER
+	----------------------
+	Paste this whole thing into the Studio Command Bar (View > Command Bar) and
+	press Enter. It scans the place and sends every script to viewer.html.
+	No buttons, no menu, no clicking. Run it and it's done.
+
+	BEFORE YOU RUN IT
+	  1. python3 dump_server.py
+	  2. File > Game Settings > Security > Allow HTTP Requests = ON
+	  3. Be in EDIT mode -- not Play mode
+
+	WHY THERE'S NO BUTTON ANYMORE
+	  Studio runs button callbacks at a lower permission level than the command
+	  bar. HttpService is blocked at that level, which is what caused
+	  "The current thread cannot call this function (blocked)". Sending straight
+	  from the command bar thread avoids the problem entirely.
+]]
+
+local URL         = "http://localhost:8080/api/upload"
+local BATCH_CHARS = 150000
+
+--------------------------------------------------------------------------------
+
+local HttpService = game:GetService("HttpService")
+
+local ROOTS = {
+	"Workspace", "Players", "Lighting", "ReplicatedFirst", "ReplicatedStorage",
+	"ServerScriptService", "ServerStorage", "StarterGui", "StarterPack",
+	"StarterPlayer", "SoundService", "Teams", "Chat", "TextChatService",
+	"MaterialService", "TestService",
+}
+
+-- 1. SCAN -----------------------------------------------------------------
+
+local scripts, readable = {}, 0
+
+for _, name in ipairs(ROOTS) do
+	local ok, service = pcall(game.GetService, game, name)
+	if ok and service then
+		local ok2, kids = pcall(service.GetDescendants, service)
+		if ok2 then
+			for _, inst in ipairs(kids) do
+				if inst:IsA("LuaSourceContainer") then
+					local gotSource, source = pcall(function() return inst.Source end)
+					if not gotSource or type(source) ~= "string" then
+						source = "-- source unreadable: " .. tostring(source)
+					else
+						readable += 1
+					end
+
+					local path = inst:GetFullName():gsub("^game%.", "")
+					table.insert(scripts, {
+						path   = path,
+						name   = inst.Name,
+						class  = inst.ClassName,
+						lines  = select(2, source:gsub("\n", "")) + 1,
+						chars  = #source,
+						source = source,
+						ok     = gotSource and type(source) == "string",
+					})
+				end
+			end
+		end
+	end
+end
+
+table.sort(scripts, function(a, b) return a.path:lower() < b.path:lower() end)
+
+print(("[dump] found %d scripts, %d readable"):format(#scripts, readable))
+
+if #scripts == 0 then
+	warn("[dump] nothing found -- is the place actually open?")
+	return
+end
+
+if readable == 0 then
+	warn("[dump] ==================================================")
+	warn("[dump] Every script came back empty.")
+	warn("[dump] Reading Source needs plugin permission, so:")
+	warn("[dump]   - run this from the COMMAND BAR, not a Script")
+	warn("[dump]   - stop Play mode first and go back to EDIT mode")
+	warn("[dump] ==================================================")
+end
+
+-- 2. SEND -----------------------------------------------------------------
+
+local session = ("%d_%d"):format(os.time(), math.random(1000, 9999))
+local batch, batchChars, part, sent = {}, 0, 0, 0
+
+local function flush(isFinal)
+	part += 1
+
+	local body = HttpService:JSONEncode({
+		session = session,
+		place   = game.Name,
+		placeId = game.PlaceId,
+		part    = part,
+		final   = isFinal,
+		total   = #scripts,
+		scripts = batch,
+	})
+
+	local ok, err = pcall(function()
+		return HttpService:PostAsync(URL, body, Enum.HttpContentType.ApplicationJson, false)
+	end)
+
+	if not ok then
+		err = tostring(err)
+		warn(("[dump] send failed on part %d: %s"):format(part, err))
+
+		if err:find("blocked") or err:find("cannot call") then
+			warn("[dump] Permission problem. Paste this into the COMMAND BAR")
+			warn("[dump] in Edit mode -- not into a Script, not during Play mode.")
+		elseif err:find("not enabled") or err:find("Http requests") then
+			warn("[dump] Turn on File > Game Settings > Security > Allow HTTP Requests.")
+		elseif err:find("ConnectFail") or err:find("Timedout") or err:find("curl") then
+			warn("[dump] Can't reach " .. URL)
+			warn("[dump] Start the bridge first:  python3 dump_server.py")
+		end
+		return false
+	end
+
+	sent += #batch
+	print(("[dump] sent %d / %d"):format(sent, #scripts))
+	batch, batchChars = {}, 0
+	return true
+end
+
+for i, item in ipairs(scripts) do
+	table.insert(batch, item)
+	batchChars += item.chars + 200
+
+	if batchChars >= BATCH_CHARS or i == #scripts then
+		if not flush(i == #scripts) then return end
+	end
+end
+
+print(("[dump] done -- %d scripts sent. Open http://localhost:8080"):format(sent))
