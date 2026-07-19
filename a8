@@ -1,0 +1,173 @@
+--[[
+	TestPanelUI.client.lua
+	Place in StarterPlayer > StarterPlayerScripts.
+
+	The visible menu. It only draws controls and forwards clicks to the
+	server-side test panel -- it holds no game logic of its own. If the server
+	script is absent (e.g. published build), this UI simply never appears.
+--]]
+
+local RunService       = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players          = game:GetService("Players")
+
+if not RunService:IsStudio() then return end
+
+local player = Players.LocalPlayer
+
+local remote = ReplicatedStorage:WaitForChild("__TestPanelRemote", 15)
+if not remote then
+	warn("[TestPanelUI] Server panel not found -- is TestPanel.server.lua in ServerScriptService?")
+	return
+end
+
+--------------------------------------------------------------------------------
+-- BUILD UI
+--------------------------------------------------------------------------------
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "TestPanelUI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(320, 400)
+frame.Position = UDim2.new(1, -340, 0, 20)
+frame.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
+frame.BorderSizePixel = 0
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+local pad = Instance.new("UIPadding", frame)
+pad.PaddingTop = UDim.new(0, 12)
+pad.PaddingLeft = UDim.new(0, 12)
+pad.PaddingRight = UDim.new(0, 12)
+pad.PaddingBottom = UDim.new(0, 12)
+
+local layout = Instance.new("UIListLayout", frame)
+layout.Padding = UDim.new(0, 8)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local function label(text, size, color)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.new(1, 0, 0, size or 22)
+	l.BackgroundTransparency = 1
+	l.Font = Enum.Font.GothamMedium
+	l.TextSize = 14
+	l.TextColor3 = color or Color3.fromRGB(230, 230, 235)
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Text = text
+	l.Parent = frame
+	return l
+end
+
+label("SERVER TEST PANEL", 24, Color3.fromRGB(120, 200, 255))
+label("Studio-only. Owner-gated.", 16, Color3.fromRGB(140, 140, 150))
+
+-- item uid input
+local uidBox = Instance.new("TextBox")
+uidBox.Size = UDim2.new(1, 0, 0, 32)
+uidBox.BackgroundColor3 = Color3.fromRGB(38, 40, 48)
+uidBox.TextColor3 = Color3.fromRGB(240, 240, 245)
+uidBox.PlaceholderText = "item uid (or click Pick)"
+uidBox.Font = Enum.Font.Code
+uidBox.TextSize = 13
+uidBox.ClearTextOnFocus = false
+uidBox.Text = ""
+uidBox.Parent = frame
+Instance.new("UICorner", uidBox).CornerRadius = UDim.new(0, 6)
+
+-- fire count input
+local countBox = Instance.new("TextBox")
+countBox.Size = UDim2.new(1, 0, 0, 32)
+countBox.BackgroundColor3 = Color3.fromRGB(38, 40, 48)
+countBox.TextColor3 = Color3.fromRGB(240, 240, 245)
+countBox.PlaceholderText = "fire count (2-100)"
+countBox.Font = Enum.Font.Code
+countBox.TextSize = 13
+countBox.Text = "10"
+countBox.Parent = frame
+Instance.new("UICorner", countBox).CornerRadius = UDim.new(0, 6)
+
+local function button(text, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 34)
+	b.BackgroundColor3 = color or Color3.fromRGB(52, 120, 200)
+	b.TextColor3 = Color3.fromRGB(255, 255, 255)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 14
+	b.Text = text
+	b.AutoButtonColor = true
+	b.Parent = frame
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+	return b
+end
+
+local pickBtn   = button("Pick first inventory item", Color3.fromRGB(70, 74, 84))
+local sellBtn   = button("Run sell-burst test")
+local redeemBtn = button("Run redeem throttle test", Color3.fromRGB(160, 110, 60))
+
+-- output area
+local out = Instance.new("TextLabel")
+out.Size = UDim2.new(1, 0, 0, 150)
+out.BackgroundColor3 = Color3.fromRGB(16, 17, 21)
+out.TextColor3 = Color3.fromRGB(200, 205, 210)
+out.Font = Enum.Font.Code
+out.TextSize = 12
+out.TextXAlignment = Enum.TextXAlignment.Left
+out.TextYAlignment = Enum.TextYAlignment.Top
+out.TextWrapped = true
+out.Text = "Results appear here."
+out.Parent = frame
+Instance.new("UICorner", out).CornerRadius = UDim.new(0, 6)
+local outPad = Instance.new("UIPadding", out)
+outPad.PaddingTop = UDim.new(0, 6)
+outPad.PaddingLeft = UDim.new(0, 8)
+outPad.PaddingRight = UDim.new(0, 8)
+
+--------------------------------------------------------------------------------
+-- WIRING
+--------------------------------------------------------------------------------
+
+local function show(res)
+	if typeof(res) ~= "table" then out.Text = "no response"; return end
+	local ok = res.ok
+	out.TextColor3 = ok and Color3.fromRGB(120, 220, 140) or Color3.fromRGB(240, 130, 130)
+	out.Text = res.summary or (ok and "ok" or "failed")
+end
+
+pickBtn.MouseButton1Click:Connect(function()
+	local res = remote:InvokeServer("listInventory")
+	if res and res.ok and res.uids and res.uids[1] then
+		uidBox.Text = res.uids[1]
+		out.TextColor3 = Color3.fromRGB(200, 205, 210)
+		out.Text = string.format("%d items. Picked: %s", #res.uids, res.uids[1])
+	else
+		out.TextColor3 = Color3.fromRGB(240, 130, 130)
+		out.Text = "No inventory items found (or adapter not wired)."
+	end
+end)
+
+sellBtn.MouseButton1Click:Connect(function()
+	local uid = uidBox.Text
+	if uid == "" then out.Text = "Enter an item uid first."; return end
+	out.TextColor3 = Color3.fromRGB(200, 205, 210)
+	out.Text = "running..."
+	local res = remote:InvokeServer("sellBurst", {
+		uid = uid,
+		count = tonumber(countBox.Text) or 10,
+	})
+	show(res)
+end)
+
+redeemBtn.MouseButton1Click:Connect(function()
+	out.TextColor3 = Color3.fromRGB(200, 205, 210)
+	out.Text = "running..."
+	local res = remote:InvokeServer("redeemThrottle", {
+		count = tonumber(countBox.Text) or 10,
+	})
+	show(res)
+end)
+
+print("[TestPanelUI] Panel loaded.")
