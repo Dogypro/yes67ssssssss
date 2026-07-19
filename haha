@@ -1,0 +1,662 @@
+--[[
+	SCRIPT DUMP EXPLORER
+	--------------------
+	Scans the place for every Script / LocalScript / ModuleScript, lists them in a
+	searchable menu, shows the source, and lets you copy one script or all of them.
+
+	HOW TO RUN
+	  Option A (easiest):  View > Command Bar in Studio, paste this whole file, press Enter.
+	  Option B (plugin):   Save as a Script inside a Folder, right-click the Folder >
+	                       "Save as Local Plugin", then run it from the Plugins tab.
+
+	WHY IT MUST RUN IN STUDIO
+	  Instance.Source has PluginSecurity. A LocalScript running in a live game gets
+	  "The current identity cannot read Source" no matter what you do. Studio command
+	  bar and plugins run at an identity that is allowed to read it.
+
+	COPY BEHAVIOUR
+	  Roblox has no official clipboard API. The Copy buttons load the text into a
+	  TextBox and select all of it for you -- just press Ctrl+C (Cmd+C on Mac).
+	  If a `setclipboard` global exists in your environment, it's used directly instead.
+]]
+
+--==============================================================================
+-- CONFIG
+--==============================================================================
+
+local CONFIG = {
+	Title              = "Script Dump Explorer",
+	MaxDumpChars       = 3000000,  -- refuse Copy All beyond this, TextBoxes choke
+	MaxPreviewChars    = 400000,   -- truncate a single script preview beyond this
+	IncludeArchivable  = true,     -- set false to skip Archivable=false instances
+	Separator          = string.rep("=", 78),
+}
+
+local CLASS_COLOR = {
+	Script       = Color3.fromRGB(88, 166, 255),
+	LocalScript  = Color3.fromRGB(118, 214, 140),
+	ModuleScript = Color3.fromRGB(240, 186, 90),
+}
+
+local THEME = {
+	Bg       = Color3.fromRGB(24, 25, 28),
+	Panel    = Color3.fromRGB(31, 33, 37),
+	Panel2   = Color3.fromRGB(38, 41, 46),
+	Stroke   = Color3.fromRGB(55, 58, 64),
+	Text     = Color3.fromRGB(228, 230, 234),
+	TextDim  = Color3.fromRGB(146, 151, 160),
+	Accent   = Color3.fromRGB(88, 166, 255),
+	Good     = Color3.fromRGB(118, 214, 140),
+	Bad      = Color3.fromRGB(235, 110, 110),
+}
+
+--==============================================================================
+-- SCANNING
+--==============================================================================
+
+local SCAN_ROOTS = {
+	"Workspace", "Players", "Lighting", "ReplicatedFirst", "ReplicatedStorage",
+	"ServerScriptService", "ServerStorage", "StarterGui", "StarterPack",
+	"StarterPlayer", "SoundService", "Teams", "Chat", "TextChatService",
+	"MaterialService", "TestService",
+}
+
+-- Returns the full path of an instance without the leading "game."
+local function fullPath(inst)
+	local ok, path = pcall(function()
+		return inst:GetFullName()
+	end)
+	if not ok then
+		return inst.Name
+	end
+	return (path:gsub("^game%.", ""))
+end
+
+-- Reads .Source, returning nil plus a reason on failure.
+local function readSource(inst)
+	local ok, result = pcall(function()
+		return inst.Source
+	end)
+	if ok and type(result) == "string" then
+		return result, nil
+	end
+	return nil, tostring(result)
+end
+
+local function collectScripts()
+	local found = {}
+
+	for _, serviceName in ipairs(SCAN_ROOTS) do
+		local ok, service = pcall(game.GetService, game, serviceName)
+		if ok and service then
+			local ok2, descendants = pcall(service.GetDescendants, service)
+			if ok2 then
+				for _, inst in ipairs(descendants) do
+					if inst:IsA("LuaSourceContainer") then
+						if CONFIG.IncludeArchivable or inst.Archivable then
+							local src, err = readSource(inst)
+							table.insert(found, {
+								Instance = inst,
+								Name     = inst.Name,
+								Class    = inst.ClassName,
+								Path     = fullPath(inst),
+								Source   = src,
+								Error    = err,
+								Lines    = src and (select(2, src:gsub("\n", "")) + 1) or 0,
+								Chars    = src and #src or 0,
+							})
+						end
+					end
+				end
+			end
+		end
+	end
+
+	table.sort(found, function(a, b)
+		if a.Class ~= b.Class then
+			return a.Class < b.Class
+		end
+		return a.Path:lower() < b.Path:lower()
+	end)
+
+	return found
+end
+
+--==============================================================================
+-- GUI HELPERS
+--==============================================================================
+
+local function new(class, props, children)
+	local inst = Instance.new(class)
+	for k, v in pairs(props or {}) do
+		if k ~= "Parent" then
+			inst[k] = v
+		end
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = inst
+	end
+	if props and props.Parent then
+		inst.Parent = props.Parent
+	end
+	return inst
+end
+
+local function corner(radius)
+	return new("UICorner", { CornerRadius = UDim.new(0, radius or 6) })
+end
+
+local function stroke(color, thickness)
+	return new("UIStroke", {
+		Color = color or THEME.Stroke,
+		Thickness = thickness or 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+end
+
+local function padding(px)
+	return new("UIPadding", {
+		PaddingTop = UDim.new(0, px),
+		PaddingBottom = UDim.new(0, px),
+		PaddingLeft = UDim.new(0, px),
+		PaddingRight = UDim.new(0, px),
+	})
+end
+
+--==============================================================================
+-- BUILD WINDOW
+--==============================================================================
+
+-- Nuke a previous run so re-running doesn't stack windows.
+for _, host in ipairs({ game:GetService("CoreGui"), game:GetService("StarterGui") }) do
+	local old = host:FindFirstChild("ScriptDumpExplorer")
+	if old then
+		old:Destroy()
+	end
+end
+
+local guiParent = game:GetService("CoreGui")
+if not pcall(function() return guiParent.Name end) then
+	guiParent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local screen = new("ScreenGui", {
+	Name = "ScriptDumpExplorer",
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 9999,
+	Parent = guiParent,
+})
+
+local window = new("Frame", {
+	Name = "Window",
+	Size = UDim2.fromOffset(980, 620),
+	Position = UDim2.new(0.5, -490, 0.5, -310),
+	BackgroundColor3 = THEME.Bg,
+	BorderSizePixel = 0,
+	Parent = screen,
+}, { corner(10), stroke(THEME.Stroke) })
+
+--------------------------------------------------------------------- title bar
+
+local titleBar = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundColor3 = THEME.Panel,
+	BorderSizePixel = 0,
+	Parent = window,
+}, { corner(10) })
+
+new("Frame", { -- squares off the bottom of the rounded title bar
+	Size = UDim2.new(1, 0, 0, 12),
+	Position = UDim2.new(0, 0, 1, -12),
+	BackgroundColor3 = THEME.Panel,
+	BorderSizePixel = 0,
+	Parent = titleBar,
+})
+
+new("TextLabel", {
+	Size = UDim2.new(1, -120, 1, 0),
+	Position = UDim2.fromOffset(14, 0),
+	BackgroundTransparency = 1,
+	Text = CONFIG.Title,
+	TextColor3 = THEME.Text,
+	TextSize = 15,
+	Font = Enum.Font.GothamMedium,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = titleBar,
+})
+
+local closeBtn = new("TextButton", {
+	Size = UDim2.fromOffset(28, 28),
+	Position = UDim2.new(1, -34, 0, 6),
+	BackgroundColor3 = THEME.Panel2,
+	Text = "X",
+	TextColor3 = THEME.TextDim,
+	TextSize = 13,
+	Font = Enum.Font.GothamBold,
+	AutoButtonColor = true,
+	Parent = titleBar,
+}, { corner(6) })
+
+closeBtn.MouseButton1Click:Connect(function()
+	screen:Destroy()
+end)
+
+-- dragging
+do
+	local dragging, dragStart, startPos = false, nil, nil
+	titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = window.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	game:GetService("UserInputService").InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			window.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+--------------------------------------------------------------------- left pane
+
+local leftPane = new("Frame", {
+	Size = UDim2.new(0, 340, 1, -88),
+	Position = UDim2.fromOffset(10, 46),
+	BackgroundColor3 = THEME.Panel,
+	BorderSizePixel = 0,
+	Parent = window,
+}, { corner(8), stroke() })
+
+local searchBox = new("TextBox", {
+	Size = UDim2.new(1, -16, 0, 30),
+	Position = UDim2.fromOffset(8, 8),
+	BackgroundColor3 = THEME.Panel2,
+	Text = "",
+	PlaceholderText = "Search name, path or class...",
+	PlaceholderColor3 = THEME.TextDim,
+	TextColor3 = THEME.Text,
+	TextSize = 13,
+	Font = Enum.Font.Gotham,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ClearTextOnFocus = false,
+	Parent = leftPane,
+}, { corner(6), new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
+
+local listScroll = new("ScrollingFrame", {
+	Size = UDim2.new(1, -16, 1, -46),
+	Position = UDim2.fromOffset(8, 44),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 5,
+	ScrollBarImageColor3 = THEME.Stroke,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	Parent = leftPane,
+}, {
+	new("UIListLayout", {
+		Padding = UDim.new(0, 4),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+
+-------------------------------------------------------------------- right pane
+
+local rightPane = new("Frame", {
+	Size = UDim2.new(1, -370, 1, -88),
+	Position = UDim2.fromOffset(360, 46),
+	BackgroundColor3 = THEME.Panel,
+	BorderSizePixel = 0,
+	Parent = window,
+}, { corner(8), stroke() })
+
+local headerLabel = new("TextLabel", {
+	Size = UDim2.new(1, -16, 0, 34),
+	Position = UDim2.fromOffset(8, 6),
+	BackgroundTransparency = 1,
+	Text = "Select a script from the list",
+	TextColor3 = THEME.TextDim,
+	TextSize = 13,
+	Font = Enum.Font.Code,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = rightPane,
+})
+
+local sourceScroll = new("ScrollingFrame", {
+	Size = UDim2.new(1, -16, 1, -50),
+	Position = UDim2.fromOffset(8, 42),
+	BackgroundColor3 = Color3.fromRGB(18, 19, 22),
+	BorderSizePixel = 0,
+	ScrollBarThickness = 6,
+	ScrollBarImageColor3 = THEME.Stroke,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.XY,
+	Parent = rightPane,
+}, { corner(6) })
+
+local sourceBox = new("TextBox", {
+	Size = UDim2.new(1, -16, 0, 0),
+	Position = UDim2.fromOffset(8, 8),
+	AutomaticSize = Enum.AutomaticSize.XY,
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = THEME.Text,
+	TextSize = 13,
+	Font = Enum.Font.Code,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	MultiLine = true,
+	ClearTextOnFocus = false,
+	TextWrapped = false,
+	Parent = sourceScroll,
+})
+
+--------------------------------------------------------------------- bottom bar
+
+local bottomBar = new("Frame", {
+	Size = UDim2.new(1, -20, 0, 32),
+	Position = UDim2.new(0, 10, 1, -38),
+	BackgroundTransparency = 1,
+	Parent = window,
+})
+
+local function makeButton(text, width, xOffset, color)
+	return new("TextButton", {
+		Size = UDim2.fromOffset(width, 32),
+		Position = UDim2.fromOffset(xOffset, 0),
+		BackgroundColor3 = color or THEME.Panel2,
+		Text = text,
+		TextColor3 = THEME.Text,
+		TextSize = 13,
+		Font = Enum.Font.GothamMedium,
+		AutoButtonColor = true,
+		Parent = bottomBar,
+	}, { corner(6), stroke() })
+end
+
+local copyBtn      = makeButton("Copy This Script", 140, 0)
+local copyAllBtn   = makeButton("Copy Everything", 140, 148, THEME.Accent)
+local refreshBtn   = makeButton("Rescan", 80, 296)
+
+copyAllBtn.TextColor3 = Color3.fromRGB(12, 14, 18)
+
+local statusLabel = new("TextLabel", {
+	Size = UDim2.new(1, -390, 1, 0),
+	Position = UDim2.fromOffset(386, 0),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = THEME.TextDim,
+	TextSize = 12,
+	Font = Enum.Font.Gotham,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = bottomBar,
+})
+
+local function setStatus(msg, color)
+	statusLabel.Text = msg
+	statusLabel.TextColor3 = color or THEME.TextDim
+end
+
+--==============================================================================
+-- CLIPBOARD
+--==============================================================================
+
+-- Hidden TextBox used for the select-all fallback so we never clobber the viewer.
+local clipBox = new("TextBox", {
+	Size = UDim2.fromOffset(1, 1),
+	Position = UDim2.fromOffset(-5, -5),
+	BackgroundTransparency = 1,
+	TextTransparency = 1,
+	Text = "",
+	MultiLine = true,
+	ClearTextOnFocus = false,
+	Parent = screen,
+})
+
+local function copyToClipboard(text, label)
+	if #text == 0 then
+		setStatus("Nothing to copy.", THEME.Bad)
+		return
+	end
+	if #text > CONFIG.MaxDumpChars then
+		setStatus(("Too large to copy (%d chars, limit %d). Filter the list and copy in parts.")
+			:format(#text, CONFIG.MaxDumpChars), THEME.Bad)
+		return
+	end
+
+	-- Executor / plugin environments sometimes expose a real clipboard function.
+	if typeof(setclipboard) == "function" then
+		local ok = pcall(setclipboard, text)
+		if ok then
+			setStatus(("Copied %s to clipboard (%d chars)."):format(label, #text), THEME.Good)
+			return
+		end
+	end
+
+	clipBox.Text = text
+	clipBox:CaptureFocus()
+	clipBox.SelectionStart = 1
+	clipBox.CursorPosition = #clipBox.Text + 1
+	setStatus(("%s selected (%d chars) -- press Ctrl+C now."):format(label, #text), THEME.Good)
+end
+
+--==============================================================================
+-- STATE + RENDERING
+--==============================================================================
+
+local allScripts = {}
+local selected = nil
+local rowButtons = {}
+
+local function formatEntry(entry)
+	local header = ("%s\n-- %s  [%s]  %d lines\n%s")
+		:format(CONFIG.Separator, entry.Path, entry.Class, entry.Lines, CONFIG.Separator)
+	local body = entry.Source or ("-- <unreadable: " .. tostring(entry.Error) .. ">")
+	return header .. "\n" .. body
+end
+
+local function selectEntry(entry)
+	selected = entry
+
+	for _, btn in ipairs(rowButtons) do
+		btn.BackgroundColor3 = (btn:GetAttribute("Path") == entry.Path) and THEME.Panel2 or THEME.Bg
+	end
+
+	headerLabel.Text = ("%s  [%s]  -- %d lines, %d chars")
+		:format(entry.Path, entry.Class, entry.Lines, entry.Chars)
+	headerLabel.TextColor3 = CLASS_COLOR[entry.Class] or THEME.Text
+
+	local src = entry.Source
+	if not src then
+		sourceBox.Text = "-- Source could not be read.\n-- " .. tostring(entry.Error)
+			.. "\n\n-- This happens when the code runs at an identity without PluginSecurity."
+			.. "\n-- Run it from the Studio Command Bar or as a plugin."
+	elseif #src > CONFIG.MaxPreviewChars then
+		sourceBox.Text = src:sub(1, CONFIG.MaxPreviewChars)
+			.. ("\n\n-- [preview truncated at %d chars -- use Copy This Script for the full text]")
+				:format(CONFIG.MaxPreviewChars)
+	else
+		sourceBox.Text = src
+	end
+
+	sourceScroll.CanvasPosition = Vector2.zero
+end
+
+local function buildRow(entry, index)
+	local row = new("TextButton", {
+		Size = UDim2.new(1, -6, 0, 40),
+		BackgroundColor3 = THEME.Bg,
+		BorderSizePixel = 0,
+		Text = "",
+		AutoButtonColor = false,
+		LayoutOrder = index,
+		Parent = listScroll,
+	}, { corner(6) })
+
+	row:SetAttribute("Path", entry.Path)
+
+	new("Frame", {
+		Size = UDim2.new(0, 3, 1, -10),
+		Position = UDim2.fromOffset(0, 5),
+		BackgroundColor3 = CLASS_COLOR[entry.Class] or THEME.TextDim,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, { corner(2) })
+
+	new("TextLabel", {
+		Size = UDim2.new(1, -60, 0, 16),
+		Position = UDim2.fromOffset(10, 4),
+		BackgroundTransparency = 1,
+		Text = entry.Name,
+		TextColor3 = entry.Source and THEME.Text or THEME.Bad,
+		TextSize = 13,
+		Font = Enum.Font.GothamMedium,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = row,
+	})
+
+	new("TextLabel", {
+		Size = UDim2.new(1, -60, 0, 14),
+		Position = UDim2.fromOffset(10, 21),
+		BackgroundTransparency = 1,
+		Text = entry.Path,
+		TextColor3 = THEME.TextDim,
+		TextSize = 11,
+		Font = Enum.Font.Code,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = row,
+	})
+
+	new("TextLabel", {
+		Size = UDim2.fromOffset(44, 40),
+		Position = UDim2.new(1, -48, 0, 0),
+		BackgroundTransparency = 1,
+		Text = entry.Lines .. "L",
+		TextColor3 = THEME.TextDim,
+		TextSize = 11,
+		Font = Enum.Font.Code,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+
+	row.MouseEnter:Connect(function()
+		if selected ~= entry then
+			row.BackgroundColor3 = THEME.Panel2
+		end
+	end)
+	row.MouseLeave:Connect(function()
+		if selected ~= entry then
+			row.BackgroundColor3 = THEME.Bg
+		end
+	end)
+	row.MouseButton1Click:Connect(function()
+		selectEntry(entry)
+	end)
+
+	table.insert(rowButtons, row)
+	return row
+end
+
+local function renderList(filter)
+	for _, child in ipairs(listScroll:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+	table.clear(rowButtons)
+
+	filter = (filter or ""):lower()
+	local shown, unreadable = 0, 0
+
+	for i, entry in ipairs(allScripts) do
+		local haystack = (entry.Name .. " " .. entry.Path .. " " .. entry.Class):lower()
+		if filter == "" or haystack:find(filter, 1, true) then
+			buildRow(entry, i)
+			shown += 1
+			if not entry.Source then
+				unreadable += 1
+			end
+		end
+	end
+
+	local msg = ("%d of %d scripts shown"):format(shown, #allScripts)
+	if unreadable > 0 then
+		msg ..= (" (%d unreadable)"):format(unreadable)
+	end
+	setStatus(msg)
+	return shown
+end
+
+local function rescan()
+	setStatus("Scanning...")
+	allScripts = collectScripts()
+	selected = nil
+	headerLabel.Text = "Select a script from the list"
+	headerLabel.TextColor3 = THEME.TextDim
+	sourceBox.Text = ""
+	renderList(searchBox.Text)
+end
+
+--==============================================================================
+-- WIRING
+--==============================================================================
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+	renderList(searchBox.Text)
+end)
+
+refreshBtn.MouseButton1Click:Connect(rescan)
+
+copyBtn.MouseButton1Click:Connect(function()
+	if not selected then
+		setStatus("No script selected.", THEME.Bad)
+		return
+	end
+	if not selected.Source then
+		setStatus("That script's source could not be read.", THEME.Bad)
+		return
+	end
+	copyToClipboard(selected.Source, selected.Name)
+end)
+
+copyAllBtn.MouseButton1Click:Connect(function()
+	local filter = searchBox.Text:lower()
+	local parts, count = {}, 0
+
+	table.insert(parts, ("-- Script dump of %s -- %d total scripts found")
+		:format(game.Name, #allScripts))
+	table.insert(parts, "")
+
+	for _, entry in ipairs(allScripts) do
+		local haystack = (entry.Name .. " " .. entry.Path .. " " .. entry.Class):lower()
+		if filter == "" or haystack:find(filter, 1, true) then
+			table.insert(parts, formatEntry(entry))
+			table.insert(parts, "")
+			count += 1
+		end
+	end
+
+	local label = (filter == "") and ("all " .. count .. " scripts")
+		or (count .. " matching scripts")
+	copyToClipboard(table.concat(parts, "\n"), label)
+end)
+
+rescan()
+
+print("[ScriptDumpExplorer] Ready --", #allScripts, "scripts found.")
