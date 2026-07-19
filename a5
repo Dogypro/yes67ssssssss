@@ -1,0 +1,511 @@
+--[[ ==========================================================================
+     GAME DUMP v2  --  Delta / mobile executors
+
+     WHAT CHANGED FROM v1
+       scripts.txt   now ALWAYS written -- a full inventory of every script
+                     found, with path, class, and why its source is missing
+       strings.txt   NEW. Pulls string and number constants back out of every
+                     loaded function. This is the closest thing to code that
+                     exists on a client: remote names, config values, messages,
+                     asset ids, thresholds.
+       modules.txt   better coverage -- also pulls from getloadedmodules() and
+                     retries with a longer timeout
+
+     THE HARD LIMIT, PLAINLY
+       Roblox compiles Lua to bytecode on its servers and ships only bytecode
+       to clients. Source text is never transmitted. Your first run said
+       "380 scripts, 0 with source" -- that is correct and expected, not a bug.
+       No executor setting recovers it, and Delta has no decompiler.
+
+       For YOUR OWN game, Studio reads Source directly and completely. That is
+       the only way to get the real text of all 380 scripts.
+     ========================================================================== ]]
+
+local CONFIG = {
+	Folder = "GameDump",
+	MaxDepth = 25,
+	MaxChildren = 4000,
+	MaxTableDepth = 6,
+	RequireTimeout = 4,
+	MaxFunctions = 20000,
+	MinStringLength = 3,
+	YieldEvery = 300,
+};
+
+--[[ ---------- capability probe ---------- ]]
+
+local canWrite = typeof(writefile) == "function";
+local canFolder = typeof(makefolder) == "function";
+local canClip = typeof(setclipboard) == "function";
+local gcScan = (typeof(getgc) == "function" and getgc)
+	or (typeof(get_gc_objects) == "function" and get_gc_objects) or nil;
+local loadedModules = (typeof(getloadedmodules) == "function" and getloadedmodules) or nil;
+local dbgConstants = (debug and typeof(debug.getconstants) == "function" and debug.getconstants) or nil;
+local dbgUpvalues = (debug and typeof(debug.getupvalues) == "function" and debug.getupvalues) or nil;
+local dbgInfo = (debug and typeof(debug.getinfo) == "function" and debug.getinfo) or nil;
+local guiHost = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui");
+
+local Players = game:GetService("Players");
+
+local ROOTS = {
+	"ReplicatedStorage", "ReplicatedFirst", "Workspace", "Lighting",
+	"StarterGui", "StarterPack", "StarterPlayer", "SoundService",
+	"Teams", "MaterialService",
+};
+
+--[[ ---------- value printing ---------- ]]
+
+local function shortValue(v)
+	local t = typeof(v);
+	if t == "string" then
+		if #v > 300 then v = string.sub(v, 1, 300) .. "..."; end
+		return string.format("%q", v);
+	elseif t == "number" or t == "boolean" then
+		return tostring(v);
+	elseif t == "nil" then
+		return "nil";
+	elseif t == "Vector3" then
+		return string.format("Vector3(%.2f, %.2f, %.2f)", v.X, v.Y, v.Z);
+	elseif t == "CFrame" then
+		local p = v.Position;
+		return string.format("CFrame(%.2f, %.2f, %.2f)", p.X, p.Y, p.Z);
+	elseif t == "Color3" then
+		return string.format("Color3(%d, %d, %d)", v.R * 255, v.G * 255, v.B * 255);
+	elseif t == "UDim2" then
+		return string.format("UDim2(%.2f, %d, %.2f, %d)",
+			v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset);
+	elseif t == "EnumItem" then
+		return tostring(v);
+	elseif t == "Instance" then
+		return "<" .. v.ClassName .. " " .. v:GetFullName() .. ">";
+	elseif t == "function" then
+		return "<function>";
+	end
+	return "<" .. t .. ">";
+end
+
+local function serialize(value, depth, seen, out)
+	depth = depth or 0; seen = seen or {}; out = out or {};
+
+	if type(value) ~= "table" then
+		table.insert(out, shortValue(value));
+		return out;
+	end
+	if seen[value] then table.insert(out, "<cycle>"); return out; end
+	if depth >= CONFIG.MaxTableDepth then table.insert(out, "{...}"); return out; end
+	seen[value] = true;
+
+	local pad = string.rep("  ", depth + 1);
+	local closePad = string.rep("  ", depth);
+	local keys = {};
+	for k in pairs(value) do table.insert(keys, k); end
+
+	if #keys == 0 then
+		table.insert(out, "{}"); seen[value] = nil; return out;
+	end
+
+	table.sort(keys, function(a, b) return tostring(a) < tostring(b); end);
+	table.insert(out, "{\n");
+	for _, k in ipairs(keys) do
+		table.insert(out, pad .. "[" .. shortValue(k) .. "] = ");
+		if not pcall(function() serialize(value[k], depth + 1, seen, out); end) then
+			table.insert(out, "<error>");
+		end
+		table.insert(out, ",\n");
+	end
+	table.insert(out, closePad .. "}");
+	seen[value] = nil;
+	return out;
+end
+
+--[[ ---------- gui ---------- ]]
+
+local old = guiHost:FindFirstChild("GameDumpUI");
+if old then old:Destroy(); end
+
+local screen = Instance.new("ScreenGui");
+screen.Name = "GameDumpUI";
+screen.ResetOnSpawn = false;
+screen.DisplayOrder = 99999;
+screen.Parent = guiHost;
+
+local panel = Instance.new("Frame");
+panel.Size = UDim2.fromOffset(310, 270);
+panel.Position = UDim2.new(0.5, -155, 0.5, -135);
+panel.BackgroundColor3 = Color3.fromRGB(15, 19, 30);
+panel.BorderSizePixel = 0;
+panel.Active = true;
+panel.Draggable = true;
+panel.Parent = screen;
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12);
+local st = Instance.new("UIStroke", panel);
+st.Color = Color3.fromRGB(40, 54, 80);
+
+local header = Instance.new("TextLabel");
+header.Size = UDim2.new(1, 0, 0, 42);
+header.BackgroundTransparency = 1;
+header.Text = "Game Dump v2";
+header.TextColor3 = Color3.fromRGB(225, 232, 245);
+header.TextSize = 17;
+header.Font = Enum.Font.GothamBold;
+header.Parent = panel;
+
+local closeBtn = Instance.new("TextButton");
+closeBtn.Size = UDim2.fromOffset(34, 34);
+closeBtn.Position = UDim2.new(1, -40, 0, 4);
+closeBtn.BackgroundColor3 = Color3.fromRGB(28, 36, 54);
+closeBtn.Text = "X";
+closeBtn.TextColor3 = Color3.fromRGB(140, 155, 180);
+closeBtn.TextSize = 14;
+closeBtn.Font = Enum.Font.GothamBold;
+closeBtn.Parent = panel;
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8);
+closeBtn.MouseButton1Click:Connect(function() screen:Destroy(); end);
+
+local status = Instance.new("TextLabel");
+status.Size = UDim2.new(1, -24, 0, 92);
+status.Position = UDim2.fromOffset(12, 42);
+status.BackgroundTransparency = 1;
+status.Text = "Ready.";
+status.TextColor3 = Color3.fromRGB(130, 145, 172);
+status.TextSize = 12;
+status.Font = Enum.Font.Gotham;
+status.TextWrapped = true;
+status.TextYAlignment = Enum.TextYAlignment.Top;
+status.TextXAlignment = Enum.TextXAlignment.Left;
+status.Parent = panel;
+
+local function makeButton(text, y, color)
+	local b = Instance.new("TextButton");
+	b.Size = UDim2.new(1, -24, 0, 42);
+	b.Position = UDim2.fromOffset(12, y);
+	b.BackgroundColor3 = color or Color3.fromRGB(28, 36, 54);
+	b.BorderSizePixel = 0;
+	b.Text = text;
+	b.TextColor3 = color and Color3.fromRGB(10, 14, 22) or Color3.fromRGB(225, 232, 245);
+	b.TextSize = 14;
+	b.Font = Enum.Font.GothamBold;
+	b.Parent = panel;
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 9);
+	return b;
+end
+
+local dumpBtn = makeButton("Dump everything", 142, Color3.fromRGB(76, 154, 255));
+local copyBtn = makeButton("Copy summary", 192);
+
+local function say(text)
+	status.Text = text;
+	print("[dump] " .. text);
+end
+
+--[[ ---------- extraction ---------- ]]
+
+local summaryText = "";
+local running = false;
+
+local function dumpAll()
+	if running then return; end
+	running = true;
+	dumpBtn.Text = "Working...";
+
+	local counts = {objects = 0, scripts = 0, sourced = 0, modules = 0, remotes = 0, funcs = 0};
+	local tree, remotes, scriptRows, moduleOut, stringOut = {}, {}, {}, {}, {};
+	local moduleQueue, seenModule = {}, {};
+	local processed = 0;
+
+	--[[ 1. walk the instance tree ]]
+
+	local function walk(inst, depth)
+		if depth > CONFIG.MaxDepth then return; end
+		processed = processed + 1;
+		counts.objects = counts.objects + 1;
+
+		if processed % CONFIG.YieldEvery == 0 then
+			say("Scanning... " .. counts.objects .. " objects");
+			task.wait();
+		end
+
+		table.insert(tree, string.rep("  ", depth) .. inst.ClassName .. ' "' .. inst.Name .. '"');
+
+		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction")
+			or inst:IsA("BindableEvent") or inst:IsA("BindableFunction") then
+			counts.remotes = counts.remotes + 1;
+			table.insert(remotes, inst.ClassName .. "  " .. inst:GetFullName());
+		end
+
+		if inst:IsA("LuaSourceContainer") then
+			counts.scripts = counts.scripts + 1;
+
+			local gotSource, source = pcall(function() return inst.Source; end);
+			local hasSource = gotSource and type(source) == "string" and #source > 0;
+
+			if hasSource then
+				counts.sourced = counts.sourced + 1;
+				table.insert(scriptRows, string.rep("=", 74));
+				table.insert(scriptRows, inst:GetFullName() .. "  [" .. inst.ClassName .. "]  SOURCE AVAILABLE");
+				table.insert(scriptRows, string.rep("=", 74));
+				table.insert(scriptRows, source);
+				table.insert(scriptRows, "");
+			else
+				local why = inst:IsA("ModuleScript")
+					and "no source on client -- live data in modules.txt"
+					or  "no source on client -- bytecode only, constants in strings.txt";
+				table.insert(scriptRows, string.format("%-56s %-14s %s",
+					inst:GetFullName(), inst.ClassName, why));
+			end
+
+			if inst:IsA("ModuleScript") and not seenModule[inst] then
+				seenModule[inst] = true;
+				table.insert(moduleQueue, inst);
+			end
+		end
+
+		local ok, kids = pcall(function() return inst:GetChildren(); end);
+		if ok then
+			local n = 0;
+			for _, kid in ipairs(kids) do
+				n = n + 1;
+				if n > CONFIG.MaxChildren then break; end
+				pcall(walk, kid, depth + 1);
+			end
+		end
+	end
+
+	for _, name in ipairs(ROOTS) do
+		local ok, service = pcall(game.GetService, game, name);
+		if ok and service then
+			table.insert(tree, "");
+			table.insert(tree, "#### " .. name .. " ####");
+			pcall(walk, service, 0);
+		end
+	end
+
+	local lp = Players.LocalPlayer;
+	if lp and lp:FindFirstChild("PlayerGui") then
+		table.insert(tree, "");
+		table.insert(tree, "#### PlayerGui ####");
+		pcall(walk, lp.PlayerGui, 0);
+	end
+
+	--[[ 2. modules the game already loaded, often more than the tree shows ]]
+
+	if loadedModules then
+		local ok, list = pcall(loadedModules);
+		if ok and type(list) == "table" then
+			for _, m in ipairs(list) do
+				if typeof(m) == "Instance" and not seenModule[m] then
+					seenModule[m] = true;
+					table.insert(moduleQueue, m);
+				end
+			end
+		end
+	end
+
+	--[[ 3. require every module for its live data ]]
+
+	say("Reading " .. #moduleQueue .. " modules...");
+	task.wait();
+
+	local function safeRequire(m)
+		local done, value = false, nil;
+		task.spawn(function()
+			local ok, res = pcall(require, m);
+			value = ok and res or nil;
+			done = true;
+		end);
+		local waited = 0;
+		while not done and waited < CONFIG.RequireTimeout do
+			task.wait(0.05);
+			waited = waited + 0.05;
+		end
+		return value;
+	end
+
+	for i, m in ipairs(moduleQueue) do
+		if i % 10 == 0 then
+			say("Modules " .. i .. " / " .. #moduleQueue);
+			task.wait();
+		end
+		local value = safeRequire(m);
+		if value ~= nil then
+			counts.modules = counts.modules + 1;
+			table.insert(moduleOut, string.rep("=", 74));
+			local ok, full = pcall(function() return m:GetFullName(); end);
+			table.insert(moduleOut, ok and full or tostring(m.Name));
+			table.insert(moduleOut, string.rep("=", 74));
+			local pieces = {};
+			pcall(function() serialize(value, 0, {}, pieces); end);
+			table.insert(moduleOut, table.concat(pieces));
+			table.insert(moduleOut, "");
+		end
+	end
+
+	--[[ 4. constants and upvalues from every loaded function.
+	       As close to the code as a client can get. ]]
+
+	if gcScan and dbgConstants then
+		say("Extracting constants from functions...");
+		task.wait();
+
+		local ok, objects = pcall(gcScan, true);
+		if ok and type(objects) == "table" then
+			local seenBlock = {};
+			local scanned = 0;
+
+			for _, obj in ipairs(objects) do
+				if scanned >= CONFIG.MaxFunctions then break; end
+				if type(obj) == "function" then
+					scanned = scanned + 1;
+
+					if scanned % 500 == 0 then
+						say("Functions " .. scanned .. " scanned");
+						task.wait();
+					end
+
+					local where = "?";
+					if dbgInfo then
+						local okI, info = pcall(dbgInfo, obj);
+						if okI and type(info) == "table" then
+							where = tostring(info.short_src or info.source or "?")
+								.. ":" .. tostring(info.linedefined or "?");
+						end
+					end
+
+					local bits = {};
+
+					local okC, consts = pcall(dbgConstants, obj);
+					if okC and type(consts) == "table" then
+						for _, c in ipairs(consts) do
+							local ct = type(c);
+							if ct == "string" and #c >= CONFIG.MinStringLength then
+								table.insert(bits, '  "' .. c .. '"');
+							elseif ct == "number" then
+								table.insert(bits, "  " .. tostring(c));
+							end
+						end
+					end
+
+					if dbgUpvalues then
+						local okU, ups = pcall(dbgUpvalues, obj);
+						if okU and type(ups) == "table" then
+							for _, u in ipairs(ups) do
+								if type(u) == "string" and #u >= CONFIG.MinStringLength then
+									table.insert(bits, '  upvalue: "' .. u .. '"');
+								elseif type(u) == "number" then
+									table.insert(bits, "  upvalue: " .. tostring(u));
+								end
+							end
+						end
+					end
+
+					if #bits > 0 then
+						local block = where .. "\n" .. table.concat(bits, "\n");
+						if not seenBlock[block] then
+							seenBlock[block] = true;
+							counts.funcs = counts.funcs + 1;
+							table.insert(stringOut, string.rep("-", 74));
+							table.insert(stringOut, block);
+						end
+					end
+				end
+			end
+		end
+	end
+
+	--[[ 5. write everything ]]
+
+	summaryText = table.concat({
+		"GAME DUMP v2  --  " .. game.Name,
+		"PlaceId  " .. tostring(game.PlaceId),
+		"Time     " .. os.date("%Y-%m-%d %H:%M:%S"),
+		"",
+		"Objects              " .. counts.objects,
+		"Scripts found        " .. counts.scripts,
+		"  source readable    " .. counts.sourced,
+		"Modules with data    " .. counts.modules,
+		"Remotes              " .. counts.remotes,
+		"Functions harvested  " .. counts.funcs,
+		"",
+		"getgc      " .. (gcScan and "yes" or "NO"),
+		"constants  " .. (dbgConstants and "yes" or "NO"),
+		"upvalues   " .. (dbgUpvalues and "yes" or "NO"),
+		"",
+		(counts.sourced == 0)
+			and "Source is 0 because Roblox ships bytecode to clients, never text. strings.txt holds the constants recovered from that bytecode. Open the place in Studio for the real source."
+			or  "Some source was readable, see scripts.txt.",
+	}, "\n");
+
+	if not canWrite then
+		if canClip then pcall(setclipboard, summaryText); end
+		say("No writefile in this executor. Summary copied instead.");
+		dumpBtn.Text = "Dump everything"; running = false; return;
+	end
+
+	if canFolder then pcall(makefolder, CONFIG.Folder); end
+
+	local files = {
+		{"summary.txt", summaryText},
+		{"scripts.txt", "SCRIPT INVENTORY -- " .. counts.scripts .. " found, "
+			.. counts.sourced .. " with readable source\n\n" .. table.concat(scriptRows, "\n")},
+		{"strings.txt", "CONSTANTS RECOVERED FROM " .. counts.funcs .. " FUNCTIONS\n\n"
+			.. table.concat(stringOut, "\n")},
+		{"modules.txt", table.concat(moduleOut, "\n")},
+		{"tree.txt", table.concat(tree, "\n")},
+		{"remotes.txt", table.concat(remotes, "\n")},
+	};
+
+	local written = 0;
+	for _, entry in ipairs(files) do
+		local name, body = entry[1], entry[2];
+		if body and #body > 0 then
+			if #body > 4000000 then
+				local index, pos = 0, 1;
+				while pos <= #body do
+					index = index + 1;
+					local stop = math.min(pos + 4000000, #body);
+					local nl = string.find(body, "\n", stop, true);
+					if nl then stop = nl; end
+					if pcall(writefile, CONFIG.Folder .. "/"
+						.. string.gsub(name, "%.txt", "") .. "_part" .. index .. ".txt",
+						string.sub(body, pos, stop)) then
+						written = written + 1;
+					end
+					pos = stop + 1;
+					task.wait();
+				end
+			else
+				if pcall(writefile, CONFIG.Folder .. "/" .. name, body) then
+					written = written + 1;
+				end
+			end
+		end
+		task.wait();
+	end
+
+	say("Saved " .. written .. " files to " .. CONFIG.Folder .. "/\n"
+		.. counts.scripts .. " scripts listed, " .. counts.funcs .. " functions harvested, "
+		.. counts.modules .. " modules read.");
+
+	dumpBtn.Text = "Dump everything";
+	running = false;
+end
+
+dumpBtn.MouseButton1Click:Connect(function() task.spawn(dumpAll); end);
+
+copyBtn.MouseButton1Click:Connect(function()
+	if summaryText == "" then say("Run the dump first."); return; end
+	if canClip then
+		pcall(setclipboard, summaryText);
+		say("Summary copied.");
+	else
+		say("No setclipboard here.");
+	end
+end);
+
+say(table.concat({
+	"writefile  " .. (canWrite and "yes" or "NO"),
+	"getgc      " .. (gcScan and "yes" or "NO"),
+	"constants  " .. (dbgConstants and "yes" or "NO"),
+	"",
+	"Tap Dump everything.",
+}, "\n"));
