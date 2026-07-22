@@ -1,0 +1,14 @@
+local Event = game:GetService("ReplicatedStorage").Remotes.CapsuleRE
+Event:FireServer(
+    "Buy",
+    {
+        ID = "Capsule01" -- 01 to 07
+    }
+)
+local Event = game:GetService("ReplicatedStorage").Remotes.ToolRE
+Event:FireServer(
+    "Buy",
+    {
+        ID = "Taser01" -- any gun name 
+    }
+)
