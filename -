@@ -1,0 +1,83 @@
+--// Auto Hatch — Dino
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+local LP      = Players.LocalPlayer
+
+local Shared   = require(RS:WaitForChild("Shared"))
+local ItemUtil = Shared("ItemUtil")
+local TimeVal  = RS:WaitForChild("Time")
+
+local CFG = {
+    AutoHatch  = true,   -- InvokeServer("Hatch") once the timer is done
+    AutoClaim  = true,   -- skip the 4.2s spin, claim instantly
+    Tick       = 0.2,    -- registry poll rate
+    Rescan     = 2,      -- full workspace rescan interval
+}
+
+getgenv().DinoHatch = true
+
+local tracked, busy = {}, {}
+
+local function mine(v)
+    return v:GetAttribute("UserId") == LP.UserId and v:FindFirstChild("RF")
+end
+
+local function ready(egg)
+    local st = egg:GetAttribute("STime")
+    if not st then return false end
+    local ok, ht = pcall(function()
+        return ItemUtil:GetHatchTime({
+            T = egg:GetAttribute("EggType"),
+            M = egg:GetAttribute("Mutate"),
+        })
+    end)
+    return ok and ht and (TimeVal.Value - st) >= ht
+end
+
+local function fire(inst, arg, cd)
+    if busy[inst] then return end
+    busy[inst] = true
+    task.spawn(function()
+        pcall(function()
+            if arg then inst.RF:InvokeServer(arg) else inst.RF:InvokeServer() end
+        end)
+        task.wait(cd)
+        busy[inst] = nil
+    end)
+end
+
+local function scan()
+    table.clear(tracked)
+    for _, v in ipairs(workspace:GetDescendants()) do
+        if v:GetAttribute("UserId") ~= nil and mine(v) then
+            if v:GetAttribute("EggType") or v:GetAttribute("PetType") then
+                tracked[v] = true
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while getgenv().DinoHatch do
+        pcall(scan)
+        task.wait(CFG.Rescan)
+    end
+end)
+
+task.spawn(function()
+    scan()
+    while getgenv().DinoHatch do
+        for inst in pairs(tracked) do
+            if not inst:IsDescendantOf(workspace) then
+                tracked[inst] = nil
+            elseif CFG.AutoClaim and inst:GetAttribute("PetType") then
+                fire(inst, nil, 0.5)
+            elseif CFG.AutoHatch and inst:GetAttribute("EggType") and ready(inst) then
+                fire(inst, "Hatch", 1)
+            end
+        end
+        task.wait(CFG.Tick)
+    end
+end)
+
+-- stop: getgenv().DinoHatch = false
