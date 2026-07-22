@@ -1,0 +1,6 @@
+local lp = game.Players.LocalPlayer
+print("shared.spawnLocalShot:", shared.spawnLocalShot)
+for _, d in pairs(lp.PlayerScripts:GetDescendants()) do
+	if d.Name == "BaseShotc" then print("BaseShotc found under:", d.Parent:GetFullName()) end
+end
+print("WorldShots:", workspace:FindFirstChild("WorldShots"))
