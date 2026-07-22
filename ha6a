@@ -1,0 +1,680 @@
+--------------------------------------------------------------------
+-- ShotVolleyPanel
+--
+-- Place in StarterPlayer > StarterPlayerScripts as a LocalScript.
+-- Drives shared.spawnLocalShot, exposed at the bottom of the
+-- WorldShots client module. Nothing here is patched or replaced.
+--
+-- Manual only: shots go where the mouse points, when you press the
+-- trigger key. No target acquisition, no timed loop.
+--------------------------------------------------------------------
+
+local Players           = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local lp    = Players.LocalPlayer
+local mouse = lp:GetMouse()
+
+local ToolUtil = require(ReplicatedStorage:WaitForChild("Utility"):WaitForChild("ToolUtil"))
+
+--== config =========================================================
+
+local cfg = {
+	count      = 10,
+	spreadDeg  = 4,
+	delayMs    = 0,
+	maxRange   = 300,
+	triggerKey = Enum.KeyCode.R,
+	toggleKey  = Enum.KeyCode.RightShift,
+}
+
+local COL = {
+	bg     = Color3.fromRGB(17, 17, 21),
+	row    = Color3.fromRGB(30, 30, 37),
+	stroke = Color3.fromRGB(58, 58, 70),
+	text   = Color3.fromRGB(233, 233, 239),
+	dim    = Color3.fromRGB(138, 138, 152),
+	accent = Color3.fromRGB(96, 165, 250),
+	ok     = Color3.fromRGB(74, 222, 128),
+	warn   = Color3.fromRGB(250, 204, 21),
+	bad    = Color3.fromRGB(248, 113, 113),
+}
+
+local spawnLocalShot        -- resolved at bootstrap, either path
+local usingFallback = false -- true when driving BaseShotc ourselves
+local fireVolley            -- forward declaration, defined below the GUI
+local onDetect              -- assigned to refreshDetect once labels exist
+
+--== shotId detection ===============================================
+-- BaseShotc.new feeds shotId straight into ResourceUtil:GetResource("Fx", id)
+-- and returns nil when the lookup misses, so it has to be read off a real
+-- bullet rather than guessed. Bullets you fire yourself still pass through
+-- WorldShots.ChildAdded on their way to bindBullet, so they can be sampled.
+
+local shotIdByTool = {}   -- toolId -> shotId, sampled from our own bullets
+local fallbackShotId      -- from anyone's bullet, used only if we have nothing
+
+local function record(bullet)
+	local shotId = bullet:GetAttribute("shotId")
+	if not shotId then
+		return
+	end
+	if bullet:GetAttribute("userId") == lp.UserId then
+		local toolId = bullet:GetAttribute("toolId") or "__none"
+		if shotIdByTool[toolId] ~= shotId then
+			shotIdByTool[toolId] = shotId
+			if onDetect then onDetect() end
+		end
+	elseif not fallbackShotId then
+		fallbackShotId = shotId
+		if onDetect then onDetect() end
+	end
+end
+
+local worldShots = workspace:WaitForChild("WorldShots")
+for _, b in pairs(worldShots:GetChildren()) do
+	record(b)
+end
+worldShots.ChildAdded:Connect(record)
+
+--== tool / origin ==================================================
+
+local function getTool()
+	local char = lp.Character
+	return char and char:FindFirstChildWhichIsA("Tool")
+end
+
+local function currentToolId()
+	local tool = getTool()
+	if not tool then
+		return nil
+	end
+	return tool:GetAttribute("toolId") or tool.Name
+end
+
+-- returns shotId, isExactMatchForEquippedTool
+local function currentShotId()
+	local toolId = currentToolId()
+	if toolId and shotIdByTool[toolId] then
+		return shotIdByTool[toolId], true
+	end
+	for _, id in pairs(shotIdByTool) do
+		return id, false
+	end
+	return fallbackShotId, false
+end
+
+local function getOrigin()
+	local tool = getTool()
+	if tool then
+		local handle = ToolUtil:getToolInstanceHandle(tool)
+		local att = handle and handle:FindFirstChild("FireAttachment")
+		if att then
+			return att.WorldPosition
+		end
+	end
+	local char = lp.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	return hrp and hrp.Position or workspace.CurrentCamera.CFrame.Position
+end
+
+--== gui ============================================================
+
+local function new(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local gui = new("ScreenGui", {
+	Name = "ShotVolleyPanel",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, lp:WaitForChild("PlayerGui"))
+
+local panel = new("Frame", {
+	Size = UDim2.fromOffset(252, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	Position = UDim2.new(0, 24, 0.5, -150),
+	BackgroundColor3 = COL.bg,
+	BorderSizePixel = 0,
+	Active = true,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 8) }, panel)
+new("UIStroke", { Color = COL.stroke, Thickness = 1 }, panel)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+}, panel)
+new("UIListLayout", {
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Padding = UDim.new(0, 7),
+}, panel)
+
+local order = 0
+local function nextOrder()
+	order = order + 1
+	return order
+end
+
+-- title / drag handle -----------------------------------------------
+local titleBar = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 20),
+	BackgroundTransparency = 1,
+	Text = "VOLLEY",
+	Font = Enum.Font.GothamBold,
+	TextSize = 12,
+	TextColor3 = COL.dim,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	LayoutOrder = nextOrder(),
+}, panel)
+
+do
+	local dragging, dragStart, startPos
+	titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging  = true
+			dragStart = input.Position
+			startPos  = panel.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			panel.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y
+			)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+end
+
+-- detected info -------------------------------------------------------
+local infoBox = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 42),
+	BackgroundColor3 = COL.row,
+	BorderSizePixel = 0,
+	LayoutOrder = nextOrder(),
+}, panel)
+new("UICorner", { CornerRadius = UDim.new(0, 5) }, infoBox)
+
+local shotLbl = new("TextLabel", {
+	Size = UDim2.new(1, -16, 0, 16),
+	Position = UDim2.fromOffset(8, 5),
+	BackgroundTransparency = 1,
+	Text = "shotId  --",
+	Font = Enum.Font.Code,
+	TextSize = 12,
+	TextColor3 = COL.bad,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+}, infoBox)
+
+local toolLbl = new("TextLabel", {
+	Size = UDim2.new(1, -16, 0, 16),
+	Position = UDim2.fromOffset(8, 21),
+	BackgroundTransparency = 1,
+	Text = "tool  --",
+	Font = Enum.Font.Code,
+	TextSize = 12,
+	TextColor3 = COL.dim,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+}, infoBox)
+
+local function refreshDetect()
+	local id, exact = currentShotId()
+	if id then
+		shotLbl.Text = "shotId  " .. tostring(id)
+		shotLbl.TextColor3 = exact and COL.ok or COL.warn
+	else
+		shotLbl.Text = "shotId  fire your tool once"
+		shotLbl.TextColor3 = COL.bad
+	end
+	toolLbl.Text = "tool  " .. (currentToolId() or "none equipped")
+end
+onDetect = refreshDetect
+
+-- numeric field -------------------------------------------------------
+local function numberField(labelText, key, min, max)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 24),
+		BackgroundTransparency = 1,
+		LayoutOrder = nextOrder(),
+	}, panel)
+
+	new("TextLabel", {
+		Size = UDim2.new(1, -76, 1, 0),
+		BackgroundTransparency = 1,
+		Text = labelText,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = COL.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+
+	local box = new("TextBox", {
+		Size = UDim2.new(0, 68, 1, 0),
+		Position = UDim2.new(1, -68, 0, 0),
+		BackgroundColor3 = COL.row,
+		BorderSizePixel = 0,
+		Text = tostring(cfg[key]),
+		Font = Enum.Font.Code,
+		TextSize = 13,
+		TextColor3 = COL.text,
+		ClearTextOnFocus = false,
+	}, row)
+	new("UICorner", { CornerRadius = UDim.new(0, 5) }, box)
+
+	box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n then
+			cfg[key] = math.floor(math.clamp(n, min, max) + 0.5)
+		end
+		box.Text = tostring(cfg[key])
+	end)
+end
+
+numberField("Shots per volley", "count", 1, 60)
+numberField("Delay between (ms)", "delayMs", 0, 500)
+numberField("Max range (studs)", "maxRange", 10, 1000)
+
+-- spread slider -------------------------------------------------------
+do
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 38),
+		BackgroundTransparency = 1,
+		LayoutOrder = nextOrder(),
+	}, panel)
+
+	local lbl = new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 16),
+		BackgroundTransparency = 1,
+		Text = "Spread  4.0 deg",
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = COL.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+
+	local hit = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 20),
+		Position = UDim2.fromOffset(0, 18),
+		BackgroundTransparency = 1,
+	}, row)
+
+	local track = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 5),
+		Position = UDim2.new(0, 0, 0.5, -2),
+		BackgroundColor3 = COL.row,
+		BorderSizePixel = 0,
+	}, hit)
+	new("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+
+	local fill = new("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = COL.accent,
+		BorderSizePixel = 0,
+	}, track)
+	new("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+
+	local knob = new("Frame", {
+		Size = UDim2.fromOffset(12, 12),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = COL.text,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+	}, track)
+	new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+
+	local MIN_SPREAD, MAX_SPREAD = 0, 25
+
+	local function apply(alpha)
+		alpha = math.clamp(alpha, 0, 1)
+		cfg.spreadDeg = math.floor((MIN_SPREAD + alpha * (MAX_SPREAD - MIN_SPREAD)) * 10 + 0.5) / 10
+		fill.Size = UDim2.fromScale(alpha, 1)
+		knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+		lbl.Text = string.format("Spread  %.1f deg", cfg.spreadDeg)
+	end
+
+	local function setFromX(x)
+		if track.AbsoluteSize.X <= 0 then return end
+		apply((x - track.AbsolutePosition.X) / track.AbsoluteSize.X)
+	end
+
+	apply((cfg.spreadDeg - MIN_SPREAD) / (MAX_SPREAD - MIN_SPREAD))
+
+	local dragging = false
+	hit.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+end
+
+-- keybind -------------------------------------------------------------
+local awaitingBind = false
+local bindBtn
+do
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 24),
+		BackgroundTransparency = 1,
+		LayoutOrder = nextOrder(),
+	}, panel)
+
+	new("TextLabel", {
+		Size = UDim2.new(1, -76, 1, 0),
+		BackgroundTransparency = 1,
+		Text = "Trigger key",
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = COL.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+
+	bindBtn = new("TextButton", {
+		Size = UDim2.new(0, 68, 1, 0),
+		Position = UDim2.new(1, -68, 0, 0),
+		BackgroundColor3 = COL.row,
+		BorderSizePixel = 0,
+		Text = cfg.triggerKey.Name,
+		Font = Enum.Font.Code,
+		TextSize = 12,
+		TextColor3 = COL.text,
+		AutoButtonColor = true,
+	}, row)
+	new("UICorner", { CornerRadius = UDim.new(0, 5) }, bindBtn)
+
+	bindBtn.MouseButton1Click:Connect(function()
+		awaitingBind = true
+		bindBtn.Text = "press key"
+		bindBtn.TextColor3 = COL.accent
+	end)
+end
+
+-- fire button ---------------------------------------------------------
+local fireBtn = new("TextButton", {
+	Size = UDim2.new(1, 0, 0, 32),
+	BackgroundColor3 = COL.accent,
+	BorderSizePixel = 0,
+	Text = "FIRE VOLLEY",
+	Font = Enum.Font.GothamBold,
+	TextSize = 13,
+	TextColor3 = COL.bg,
+	AutoButtonColor = true,
+	LayoutOrder = nextOrder(),
+}, panel)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, fireBtn)
+
+local statusLbl = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 14),
+	BackgroundTransparency = 1,
+	Text = "waiting for module",
+	Font = Enum.Font.Gotham,
+	TextSize = 11,
+	TextColor3 = COL.dim,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	LayoutOrder = nextOrder(),
+}, panel)
+
+local statusToken = 0
+local function setStatus(text, tone)
+	statusToken = statusToken + 1
+	local mine = statusToken
+	statusLbl.Text = text
+	statusLbl.TextColor3 = tone or COL.dim
+	task.delay(3, function()
+		if statusToken == mine then
+			statusLbl.Text = "RightShift hides this panel"
+			statusLbl.TextColor3 = COL.dim
+		end
+	end)
+end
+
+fireBtn.MouseButton1Click:Connect(function()
+	fireVolley()
+end)
+
+--== fallback spawner ===============================================
+-- If the controller never published shared.spawnLocalShot, require BaseShotc
+-- directly and run our own update loop. This reimplements exactly what the
+-- controller's spawnLocalShot did -- construct, flag isLocal, store, step
+-- with :updated(dt) each frame -- minus the tostring(tick()) key collision.
+
+local ownShots = {}
+local ownCounter = 0
+
+local function findBaseShot()
+	local roots = {}
+	local function add(x) if x then table.insert(roots, x) end end
+	add(lp:FindFirstChild("PlayerScripts"))
+	add(lp:FindFirstChild("PlayerGui"))
+	add(lp:FindFirstChild("Backpack"))
+	add(lp.Character)
+	add(game:GetService("ReplicatedFirst"))
+	add(ReplicatedStorage)
+
+	for _, root in ipairs(roots) do
+		for _, d in pairs(root:GetDescendants()) do
+			if d:IsA("ModuleScript") and d.Name == "BaseShotc" then
+				return d
+			end
+		end
+	end
+	return nil
+end
+
+local function buildFallback()
+	local moduleScript = findBaseShot()
+	if not moduleScript then
+		return nil
+	end
+
+	local ok, BaseShot = pcall(require, moduleScript)
+	if not ok or type(BaseShot) ~= "table" or not BaseShot.new then
+		return nil
+	end
+
+	game:GetService("RunService").RenderStepped:Connect(function(dt)
+		for key, shot in pairs(ownShots) do
+			if shot.isDead then
+				ownShots[key] = nil
+			else
+				local fine, err = pcall(shot.updated, shot, dt)
+				if not fine then
+					ownShots[key] = nil
+					warn("[VolleyPanel] shot update failed: " .. tostring(err))
+				end
+			end
+		end
+	end)
+
+	return function(params)
+		local shot = BaseShot.new(params, nil)
+		if not shot then
+			return nil
+		end
+		shot.isLocal = true
+		shot.userId = params.userId
+		ownCounter = ownCounter + 1
+		local key = "panel_" .. ownCounter
+		ownShots[key] = shot
+		return key
+	end
+end
+
+--== firing =========================================================
+
+-- spawnLocalShot keys its table on tostring(tick()), which only resolves to
+-- roughly 10 microseconds. Without nudging the clock between iterations the
+-- loop overwrites its own entries and you get 3-4 tracers instead of 10 --
+-- and the overwritten ones leak their Fx model under CurrentCamera, since
+-- nothing is left holding a reference to call Destroy on.
+local function advanceStamp()
+	local s0 = tostring(tick())
+	repeat until tostring(tick()) ~= s0
+end
+
+local firing = false
+
+fireVolley = function()
+	if firing then
+		return
+	end
+	if not spawnLocalShot then
+		setStatus("shared.spawnLocalShot not available", COL.bad)
+		return
+	end
+
+	local shotId = currentShotId()
+	if not shotId then
+		setStatus("no shotId yet -- fire the tool normally once", COL.bad)
+		return
+	end
+
+	local target = mouse.Hit.Position
+	local toolId = currentToolId()
+	local maxAngle = math.rad(cfg.spreadDeg)
+	local count = cfg.count
+	local spaced = cfg.delayMs > 0
+
+	firing = true
+	task.spawn(function()
+		local fired = 0
+		for i = 1, count do
+			-- re-read origin each shot so spaced bursts track the hand
+			local origin = getOrigin()
+			local toTarget = target - origin
+			local dist = toTarget.Magnitude
+
+			if dist >= 1 then
+				dist = math.min(dist, cfg.maxRange)
+				local base = CFrame.lookAt(origin, target)
+				local theta = math.random() * math.pi * 2
+				-- sqrt keeps the sample density even across the cone face
+				local r = math.sqrt(math.random()) * maxAngle
+				local dir = (base * CFrame.Angles(0, 0, theta) * CFrame.Angles(r, 0, 0)).LookVector
+
+				local ok = spawnLocalShot({
+					userId      = lp.UserId,
+					toolId      = toolId,
+					shotId      = shotId,
+					origin      = origin,
+					destination = origin + dir * dist,
+				})
+				if ok then
+					fired = fired + 1
+				end
+			end
+
+			if i < count then
+				if spaced then
+					task.wait(cfg.delayMs / 1000)
+				elseif not usingFallback then
+					-- only the controller's table needs the nudge; ours is
+					-- keyed on a counter and cannot collide
+					advanceStamp()
+				end
+			end
+		end
+
+		firing = false
+		if fired == 0 then
+			setStatus("0 spawned -- check shotId, or too close", COL.bad)
+		elseif fired < count then
+			setStatus(string.format("%d/%d spawned", fired, count), COL.warn)
+		else
+			setStatus(string.format("%d fired", fired), COL.ok)
+		end
+	end)
+end
+
+--== input ==========================================================
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+	if UserInputService:GetFocusedTextBox() then
+		return
+	end
+
+	if awaitingBind then
+		awaitingBind = false
+		cfg.triggerKey = input.KeyCode
+		bindBtn.Text = input.KeyCode.Name
+		bindBtn.TextColor3 = COL.text
+		return
+	end
+
+	if input.KeyCode == cfg.toggleKey then
+		panel.Visible = not panel.Visible
+		return
+	end
+	if processed then
+		return
+	end
+	if input.KeyCode == cfg.triggerKey then
+		fireVolley()
+	end
+end)
+
+--== bootstrap ======================================================
+
+refreshDetect()
+task.spawn(function()
+	while true do
+		task.wait(0.5)
+		refreshDetect()
+	end
+end)
+
+task.spawn(function()
+	-- One instant check: if this script shares a global environment with
+	-- LocalShotMgr, reuse its spawner. If not, there is nothing to wait for --
+	-- a global that is already set either resolves now or never will.
+	if shared.spawnLocalShot then
+		spawnLocalShot = shared.spawnLocalShot
+		setStatus("ready (shared)", COL.ok)
+		return
+	end
+
+	-- Separate environment. Require BaseShotc ourselves: require() caches per
+	-- ModuleScript instance rather than per environment, so this is the same
+	-- table LocalShotMgr got.
+	spawnLocalShot = buildFallback()
+	if spawnLocalShot then
+		usingFallback = true
+		setStatus("ready (direct BaseShotc)", COL.ok)
+	else
+		setStatus("BaseShotc module not found", COL.bad)
+	end
+end)
