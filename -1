@@ -1,0 +1,17 @@
+-- https://discord.gg/dy9tAb2RcX
+
+local Event = game:GetService("ReplicatedStorage").Remotes.FoodShopRE
+
+Event:FireServer(
+
+    "Buy",
+
+    {
+
+        ID = "Food07", -- you can use 01-07
+
+        Count = 50000 -- execute with 0/0 first then add any amount of number
+
+    }
+
+)
