@@ -1,0 +1,2 @@
+local mgr = game.Players.LocalPlayer.PlayerScripts:FindFirstChild("LocalShotMgr")
+print(mgr.ClassName, mgr:IsA("LocalScript") and mgr.Enabled)
