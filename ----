@@ -1,0 +1,8 @@
+local Event = game:GetService("ReplicatedStorage").Remotes.FoodShopRE
+Event:FireServer(
+    "Buy",
+    {
+        ID = "Food07", -- you can add 01 - 08
+        Count = 0/0 -- execute then change the number into 999
+    }
+)
